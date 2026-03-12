@@ -13,6 +13,163 @@ Shmipc Adapter 提供了一种无感适配方案，通过 LD_PRELOAD 技术劫�
 3. **零拷贝透明化**：对应用完全透明，无需修改应用代码
 4. **智能降级**：当 shmipc 不可用时自动降级到原生 socket
 
+### adapter/ 目录文件结构
+
+```
+adapter/
+├── shmipc_adapter.c        # C 适配器库 - socket 函数劫持层
+├── shmipc_bridge.go       # Go 桥接库 - CGO 接口实现
+├── Makefile               # Make 构建系统 - 编译配置
+├── build.sh               # Shell 构建脚本 - 自动化构建工具
+├── test_socket_basic.c    # 基本功能测试程序 - 功能验证
+├── example_app.c         # 完整示例程序 - echo 服务器/客户端
+├── config.json            # 默认配置文件 - shmipc 参数配置
+├── README.md              # 详细使用文档 - 完整使用指南
+└── QUICKSTART.md          # 快速开始指南 - 5 分钟上手教程
+```
+
+### 文件详细作用说明
+
+#### 1. shmipc_adapter.c
+**作用**：C 适配器库，实现 socket 函数劫持
+
+**主要功能**：
+- 劫持标准 socket 函数：`socket()`, `connect()`, `bind()`, `listen()`, `accept()`, `send()`, `recv()`, `read()`, `write()`
+- 连接跟踪管理：维护 shmipc 连接状态
+- 智能路由判断：判断是否应该使用 shmipc 还是原生 socket
+- 环境变量检查控制：根据 `SHMIPC_ENABLED` 环境变量决定是否启用劫持
+
+**关键特性**：
+- 线程安全的连接管理
+- 自动降级机制：shmipc 失败时自动使用原生 socket
+- 支持 Unix Domain Socket 和 TCP localhost 自动转换
+
+#### 2. shmipc_bridge.go
+**作用**：Go 桥接库，提供 CGO 接口实现
+
+**主要功能**：
+- 实现 CGO 导出函数，供 C 代码调用
+- `shmipc_go_init()`：初始化 shmipc 库
+- `shmipc_go_server()`：创建 shmipc 服务端
+- `shmipc_go_client()`：创建 shmipc 客户端
+- `shmipc_go_accept()`：接受连接
+- `shmipc_go_connect()`：建立连接
+- `shmipc_go_send()`：发送数据（零拷贝）
+- `shmipc_go_recv()`：接收数据（零拷贝）
+- `shmipc_go_close()`：关闭连接
+
+**关键特性**：
+- 保持 shmipc 的零拷贝优势
+- 线程安全的连接和流管理
+- 错误处理和日志记录
+
+#### 3. Makefile
+**作用**：Make 构建系统，定义编译规则
+
+**主要目标**：
+
+- `all`：编译所有库（默认目标）
+- `directories`：创建构建目录
+- `$(GO_LIB)`：编译 Go 共享库
+- `$(ADAPTER_LIB)`：编译 C 适配器库
+- `install`：安装库到系统
+- `test`：运行测试程序
+- `clean`：清理编译产物
+- `dev-build`：调试版本编译
+- `perf-test`：性能测试
+- `help`：显示帮助信息
+
+**使用场景**：
+
+- 标准开发：使用 `make`
+- 调试开发：使用 `make dev-build`
+- 系统部署：使用 `make install`
+
+#### 4. build.sh
+**作用**：Shell 构建脚本，提供自动化构建工具
+
+**主要功能**：
+- 依赖检查：检查 Go、GCC、make 等工具是否安装
+- 系统检查：验证是否为 Linux 系统
+- 自动构建：自动执行清理、编译、测试等步骤
+- 友好提示：彩色输出和进度提示
+
+**使用场景**：
+- 快速构建：`./build.sh build`
+- 系统安装：`./build.sh install`
+- 功能测试：`./build.sh test`
+
+#### 5. test_socket_basic.c
+**作用**：基本功能测试程序，验证适配器功能
+
+**主要功能**：
+- Unix Domain Socket 测试：测试 Unix socket 劫持
+- TCP Localhost 测试：测试 TCP localhost 劫持
+- 基本通信测试：发送和接收数据验证
+
+**使用场景**：
+- 功能验证：验证适配器基本功能是否正常
+- 问题诊断：快速定位劫持相关问题
+- 开发调试：在开发过程中快速测试
+
+#### 6. example_app.c
+**作用**：完整示例程序，展示实际应用场景
+
+**主要功能**：
+- Echo 服务器：多线程 echo 服务器实现
+- Echo 客户端：发送数据并接收回显
+- 性能统计：显示传输的字节数和连接信息
+
+**使用场景**：
+- 学习参考：展示如何使用适配器
+- 性能测试：测试实际应用场景性能
+- 集成测试：验证与现有应用的兼容性
+
+#### 7. config.json
+**作用**：默认配置文件，定义 shmipc 参数
+
+**配置参数**：
+- `QueueCap`：队列容量（默认：65535）
+- `ShareMemoryBufferCap`：共享内存缓冲区大小（默认：256MB）
+- `MemMapType`：内存映射类型（1 = MemFd）
+- `ConnectionWriteTimeout`：连接写入超时（默认：1秒）
+- `BufferSliceSizes`：缓冲区切片大小配置
+
+**使用场景**：
+- 默认配置：提供合理的默认参数
+- 性能调优：根据应用特点调整参数
+- 资源限制：适应不同的系统资源限制
+
+#### 8. README.md
+**作用**：详细使用文档，提供完整的使用指南
+
+**主要内容**：
+- 架构设计：技术方案和组件说明
+- 编译指南：详细的编译步骤和选项
+- 使用指南：各种使用场景和示例
+- 环境变量：所有环境变量的详细说明
+- 故障排除：常见问题和解决方案
+- 性能测试：性能对比和优化建议
+
+**使用场景**：
+- 学习文档：全面了解适配器功能
+- 问题解决：遇到问题时查找解决方案
+- 最佳实践：学习正确的使用方法
+
+#### 9. QUICKSTART.md
+**作用**：快速开始指南，帮助用户快速上手
+
+**主要内容**：
+- 5 分钟快速开始：最简化的使用流程
+- 性能对比：快速的性能对比示例
+- 常用命令：最常用的命令和操作
+- 预期输出：成功运行的预期结果
+
+**使用场景**：
+- 新手入门：快速体验适配器功能
+- 快速验证：快速验证安装是否成功
+- 演示展示：向他人展示适配器功能
+
 ### 组件架构
 
 ```
@@ -107,6 +264,89 @@ make clean
 
 ## 使用指南
 
+### 环境变量详解
+
+#### export 命令作用范围
+
+**重要概念**：`export` 命令只在当前 shell 会话及其子进程中生效，不会影响整个系统。
+
+```bash
+# 只在当前终端窗口生效
+export SHMIPC_ENABLED=1
+export LD_PRELOAD=./lib/libshmipc_adapter.so:./lib/libshmipc_go.so
+
+# 在这个终端里运行的所有程序都会受到影响
+./your_application
+
+# 但在其他终端窗口中不会生效
+```
+
+#### 在 shell 脚本中使用 export
+
+在 shell 脚本中使用 `export` 会对该脚本执行期间的所有命令生效，脚本结束后环境变量不会保留到父 shell。
+
+```bash
+#!/bin/bash
+# test_with_shmipc.sh
+
+export SHMIPC_ENABLED=1
+export LD_PRELOAD=./lib/libshmipc_adapter.so:./lib/libshmipc_go.so
+
+# 这些命令会使用 shmipc
+./test_socket_basic unix_server
+./test_socket_basic unix_client
+
+# 脚本结束后，父 shell 的环境变量不受影响
+```
+
+#### 控制是否使用 shmipc 拦截
+
+**方法 1：通过 SHMIPC_ENABLED 环境变量控制**
+
+```bash
+# 场景 1：测试时使用 shmipc
+export SHMIPC_ENABLED=1
+export LD_PRELOAD=./lib/libshmipc_adapter.so:./lib/libshmipc_go.so
+./qperf -c 127.0.0.1 -p 12345 -t tcp
+
+# 场景 2：测试时不使用 shmipc（基线测试）
+unset SHMIPC_ENABLED
+export LD_PRELOAD=./lib/libshmipc_adapter.so:./lib/libshmipc_go.so
+./qperf -c 127.0.0.1 -p 12345 -t tcp
+
+# 或者完全不设置环境变量
+./qperf -c 127.0.0.1 -p 12345 -t tcp
+```
+
+**方法 2：创建不同的测试脚本**
+
+```bash
+# shmipc_test.sh - 使用 shmipc
+#!/bin/bash
+export SHMIPC_ENABLED=1
+export LD_PRELOAD=./lib/libshmipc_adapter.so:./lib/libshmipc_go.so
+./qperf "$@"
+
+# baseline_test.sh - 不使用 shmipc
+#!/bin/bash
+unset SHMIPC_ENABLED
+./qperf "$@"
+```
+
+**方法 3：在命令行直接控制**
+
+```bash
+# 业务运行时完全使用 shmipc
+SHMIPC_ENABLED=1 LD_PRELOAD=./lib/libshmipc_adapter.so:./lib/libshmipc_go.so ./your_business_app
+
+# 测试时根据需要选择
+# 使用 shmipc
+SHMIPC_ENABLED=1 LD_PRELOAD=./lib/libshmipc_adapter.so:./lib/libshmipc_go.so ./qperf -c 127.0.0.1 -p 12345
+
+# 不使用 shmipc
+./qperf -c 127.0.0.1 -p 12345
+```
+
 ### 基本使用方法
 
 #### 1. 启用 shmipc 适配器
@@ -128,6 +368,12 @@ export LD_PRELOAD=/path/to/libshmipc_adapter.so:/path/to/libshmipc_go.so
 |--------|------|----------|----------|
 | `SHMIPC_ENABLED` | 是否启用 shmipc 适配器 | 1, true, yes, 其他 | 0 (禁用) |
 | `SHMIPC_CONFIG` | shmipc 配置（JSON 格式） | 配置字符串 | 使用默认配置 |
+
+**环境变量使用说明**：
+
+- `SHMIPC_ENABLED=1`：启用 shmipc 拦截，所有符合条件的连接都会使用 shmipc
+- `SHMIPC_ENABLED=0` 或不设置：禁用 shmipc 拦截，所有连接使用原生 socket
+- `SHMIPC_CONFIG`：可选的 JSON 配置字符串，用于自定义 shmipc 参数
 
 ### 支持的连接类型
 
