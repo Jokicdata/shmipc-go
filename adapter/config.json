@@ -1,0 +1,20 @@
+{
+  "QueueCap": 65535,
+  "ShareMemoryBufferCap": 268435456,
+  "MemMapType": 1,
+  "ConnectionWriteTimeout": 1000000000,
+  "BufferSliceSizes": [
+    {
+      "Size": 4096,
+      "Percent": 70
+    },
+    {
+      "Size": 16384,
+      "Percent": 20
+    },
+    {
+      "Size": 65536,
+      "Percent": 10
+    }
+  ]
+}
