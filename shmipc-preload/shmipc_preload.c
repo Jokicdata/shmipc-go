@@ -210,9 +210,10 @@ static int should_use_shmipc(int domain, int type) {
     
     if (domain == AF_UNIX) return 1;
     
-    if ((domain == AF_INET || domain == AF_INET6) && type == SOCK_STREAM) {
-        return 1;
-    }
+    // 对于 TCP 连接，暂时返回 0，在 bind/connect 时根据地址决定
+    // if ((domain == AF_INET || domain == AF_INET6) && type == SOCK_STREAM) {
+    //     return 1;
+    // }
     
     return 0;
 }
@@ -315,6 +316,20 @@ int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
             strncpy(info->path, un->sun_path, MAX_PATH - 1);
             info->is_server = 1;
             log_msg(LOG_DEBUG, "bind(%d, \"%s\") [shmipc]", sockfd, info->path);
+        } else if (addr->sa_family == AF_INET) {
+            struct sockaddr_in *in = (struct sockaddr_in *)addr;
+            snprintf(info->path, MAX_PATH - 1, "tcp://%s:%d", 
+                     inet_ntoa(in->sin_addr), ntohs(in->sin_port));
+            info->is_server = 1;
+            log_msg(LOG_DEBUG, "bind(%d, \"%s\") [shmipc]", sockfd, info->path);
+        } else if (addr->sa_family == AF_INET6) {
+            struct sockaddr_in6 *in6 = (struct sockaddr_in6 *)addr;
+            char ip6[INET6_ADDRSTRLEN];
+            inet_ntop(AF_INET6, &in6->sin6_addr, ip6, INET6_ADDRSTRLEN);
+            snprintf(info->path, MAX_PATH - 1, "tcp6://%s:%d", 
+                     ip6, ntohs(in6->sin6_port));
+            info->is_server = 1;
+            log_msg(LOG_DEBUG, "bind(%d, \"%s\") [shmipc]", sockfd, info->path);
         }
     }
     
@@ -329,7 +344,19 @@ int listen(int sockfd, int backlog) {
     if (info) {
         info->is_listening = 1;
         
-        if (info->conn_type == CONN_TYPE_SHMIPC && info->is_server) {
+        // 对于 TCP 连接，检查是否为本地回环地址
+        if ((info->domain == AF_INET || info->domain == AF_INET6) && 
+            info->type == SOCK_STREAM && info->is_server) {
+            // 检查 path 是否包含本地回环地址
+            if (strstr(info->path, "127.0.0.1") || strstr(info->path, "::1")) {
+                info->conn_type = CONN_TYPE_SHMIPC;
+                int ret = ShmipcCreateServerSession(sockfd, info->path);
+                if (ret != 0) {
+                    log_msg(LOG_WARN, "ShmipcCreateServerSession failed: %d", ret);
+                }
+                log_msg(LOG_DEBUG, "listen(%d, %d) [shmipc]", sockfd, backlog);
+            }
+        } else if (info->conn_type == CONN_TYPE_SHMIPC && info->is_server) {
             int ret = ShmipcCreateServerSession(sockfd, info->path);
             if (ret != 0) {
                 log_msg(LOG_WARN, "ShmipcCreateServerSession failed: %d", ret);
@@ -418,12 +445,43 @@ int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
     fd_info_t *info = get_fd_info(sockfd);
     int use_shmipc = 0;
     
-    if (info && info->conn_type == CONN_TYPE_SHMIPC) {
-        if (addr && addr->sa_family == AF_UNIX) {
-            struct sockaddr_un *un = (struct sockaddr_un *)addr;
-            strncpy(info->path, un->sun_path, MAX_PATH - 1);
-            use_shmipc = 1;
-        } else if (addr && is_loopback_addr(addr, addrlen)) {
+    if (info) {
+        if (info->conn_type == CONN_TYPE_SHMIPC) {
+            if (addr && addr->sa_family == AF_UNIX) {
+                struct sockaddr_un *un = (struct sockaddr_un *)addr;
+                strncpy(info->path, un->sun_path, MAX_PATH - 1);
+                use_shmipc = 1;
+            } else if (addr && is_loopback_addr(addr, addrlen)) {
+                // 为 TCP 回环连接设置 path
+                if (addr->sa_family == AF_INET) {
+                    struct sockaddr_in *in = (struct sockaddr_in *)addr;
+                    snprintf(info->path, MAX_PATH - 1, "tcp://%s:%d", 
+                             inet_ntoa(in->sin_addr), ntohs(in->sin_port));
+                } else if (addr->sa_family == AF_INET6) {
+                    struct sockaddr_in6 *in6 = (struct sockaddr_in6 *)addr;
+                    char ip6[INET6_ADDRSTRLEN];
+                    inet_ntop(AF_INET6, &in6->sin6_addr, ip6, INET6_ADDRSTRLEN);
+                    snprintf(info->path, MAX_PATH - 1, "tcp6://%s:%d", 
+                             ip6, ntohs(in6->sin6_port));
+                }
+                use_shmipc = 1;
+            }
+        } else if ((info->domain == AF_INET || info->domain == AF_INET6) && 
+                   info->type == SOCK_STREAM && addr && is_loopback_addr(addr, addrlen)) {
+            // 对于 TCP 连接，检查是否为本地回环地址
+            info->conn_type = CONN_TYPE_SHMIPC;
+            // 设置 path
+            if (addr->sa_family == AF_INET) {
+                struct sockaddr_in *in = (struct sockaddr_in *)addr;
+                snprintf(info->path, MAX_PATH - 1, "tcp://%s:%d", 
+                         inet_ntoa(in->sin_addr), ntohs(in->sin_port));
+            } else if (addr->sa_family == AF_INET6) {
+                struct sockaddr_in6 *in6 = (struct sockaddr_in6 *)addr;
+                char ip6[INET6_ADDRSTRLEN];
+                inet_ntop(AF_INET6, &in6->sin6_addr, ip6, INET6_ADDRSTRLEN);
+                snprintf(info->path, MAX_PATH - 1, "tcp6://%s:%d", 
+                         ip6, ntohs(in6->sin6_port));
+            }
             use_shmipc = 1;
         }
     }
