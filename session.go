@@ -105,6 +105,11 @@ func Server(conn net.Conn, conf *Config) (*Session, error) {
 	return newSession(conf, conn, false)
 }
 
+// Client return a shmipc client with the giving connection and configuration
+func Client(conn net.Conn, conf *Config) (*Session, error) {
+	return newSession(conf, conn, true)
+}
+
 // newSession is used to construct a new session
 func newSession(config *Config, conn net.Conn, isClient bool) (*Session, error) {
 	if config == nil {

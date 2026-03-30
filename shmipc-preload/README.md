@@ -941,7 +941,7 @@ CGO 是 Go 语言提供的 C 语言互操作机制，允许：
 │  │              │               │              │              │              │ │
 │  │              │               │ real_connect()│              │              │ │
 │  │              │               │              │              │              │ │
-│  │              │               │ 调用 Go 接口 ─┼─────────────►│NewClientSession│
+│  │              │               │ 调用 Go 接口 ─┼─────────────►│    Client()   │
 │  │              │               │              │              │ 初始化共享内存 │ │
 │  │              │               │              │              │ 映射服务端内存 │ │
 │  │              │               │              │◄─────────────│ 创建 Session  │ │
@@ -990,7 +990,7 @@ CGO 是 Go 语言提供的 C 语言互操作机制，允许：
 | `bind()` | 记录 UDS 路径 | - | - |
 | `listen()` | 标记服务端 | `ShmipcCreateServerSession()` | `shmipc.Server()` |
 | `accept()` | 创建客户端 fd | `ShmipcAcceptStream()` | `session.AcceptStream()` |
-| `connect()` | 判断连接类型 | `ShmipcCreateClientSession()`, `ShmipcOpenStream()` | `shmipc.NewClientSession()`, `session.OpenStream()` |
+| `connect()` | 判断连接类型 | `ShmipcCreateClientSession()`, `ShmipcOpenStream()` | `shmipc.Client()`, `session.OpenStream()` |
 | `send()/write()` | 查找 stream_id | `ShmipcWrite()` | `stream.BufferWriter().WriteBytes()`, `stream.Flush()` |
 | `recv()/read()` | 查找 stream_id | `ShmipcRead()` | `stream.BufferReader().ReadBytes()`, `stream.ReleaseReadAndReuse()` |
 | `close()` | 清理资源 | `ShmipcCloseStream()`, `ShmipcCloseSession()` | `stream.Close()`, `session.Close()` |

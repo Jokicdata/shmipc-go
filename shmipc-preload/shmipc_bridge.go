@@ -98,7 +98,7 @@ func ShmipcCreateClientSession(fd C.int, path *C.char) C.int {
 
 	shmConfig := getShmipcConfig(goPath + "_client")
 
-	session, err := shmipc.NewClientSession(shmConfig, conn)
+	session, err := shmipc.Client(conn, shmConfig)
 	if err != nil {
 		conn.Close()
 		return C.int(-4)
