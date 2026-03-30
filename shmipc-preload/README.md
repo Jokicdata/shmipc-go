@@ -1169,3 +1169,67 @@ libshmipc_go.so   # Go 共享库（被 C 库动态链接）
 | 64KB | ~97μs | ~217μs | 2.2x |
 | 256KB | ~348μs | ~520μs | 1.5x |
 | 1MB | ~1078μs | ~2626μs | 2.4x |
+
+### D. 为什么只需 LD_PRELOAD 一个 .so 文件？
+
+#### 动态链接器自动加载依赖
+
+```
+用户命令：
+$ LD_PRELOAD=./libshmipc.so ./your_program
+
+动态链接器 (ld-linux.so) 的工作流程：
+
+Step 1: 加载 libshmipc.so
+         │
+         ▼
+Step 2: 读取 libshmipc.so 的 DT_NEEDED 字段
+         │
+         │  发现依赖: libshmipc_go.so
+         │
+         ▼
+Step 3: 自动加载 libshmipc_go.so
+         │
+         │  在同一目录查找（因为有 -Wl,-rpath,'$ORIGIN'）
+         │
+         ▼
+Step 4: 解析符号，绑定 extern 声明到 Go 导出函数
+```
+
+#### 关键：Makefile 中的 `-Wl,-rpath,'$ORIGIN'`
+
+```makefile
+gcc -shared -o libshmipc.so shmipc_preload.c -L. -lshmipc_go -Wl,-rpath,'$$ORIGIN'
+```
+
+| 选项 | 作用 |
+|------|------|
+| `-L.` | 编译时在当前目录搜索 `libshmipc_go.so` |
+| `-lshmipc_go` | 链接 `libshmipc_go.so`，在 `libshmipc.so` 中记录依赖 |
+| `-Wl,-rpath,'$ORIGIN'` | 运行时在 `.so 文件所在目录` 搜索依赖库 |
+
+#### 验证依赖关系
+
+```bash
+# 查看 libshmipc.so 依赖哪些库
+$ ldd libshmipc.so
+    linux-vdso.so.1 =>  ...
+    libshmipc_go.so => ./libshmipc_go.so   ← 自动找到！
+    libdl.so.2 => /lib/x86_64-linux-gnu/libdl-2.31.so
+    libc.so.6 => /lib/x86_64-linux-gnu/libc-2.31.so
+
+# 查看 ELF 文件中的依赖记录
+$ readelf -d libshmipc.so | grep NEEDED
+  0x0000000000000001 (NEEDED)   Shared library: [libshmipc_go.so]  ← 记录了依赖
+  0x0000000000000001 (NEEDED)   Shared library: [libdl.so.2]
+  0x0000000000000001 (NEEDED)   Shared library: [libc.so.6]
+```
+
+#### 总结
+
+| 文件 | 用户操作 | 系统行为 |
+|------|----------|----------|
+| `libshmipc.so` | 用户显式 LD_PRELOAD | 动态链接器首先加载 |
+| `libshmipc_go.so` | 用户无需指定 | 动态链接器自动加载（因为依赖关系） |
+
+**用户只需要 LD_PRELOAD 一个文件，但两个 .so 文件必须放在同一目录！**
