@@ -1059,9 +1059,12 @@ make
 
 编译输出：
 ```
+go.sum            # Go 依赖校验文件（自动生成）
 libshmipc_go.so   # Go 共享库（包含 shmipc 核心功能）
 libshmipc.so      # C 预加载库（用户 LD_PRELOAD 此文件）
 ```
+
+**注意**：首次编译时会自动执行 `go mod tidy` 下载依赖并生成 `go.sum` 文件。
 
 ### 7.3 安装
 

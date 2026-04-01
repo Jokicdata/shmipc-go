@@ -7,12 +7,17 @@ LDFLAGS = -shared -ldl -lpthread
 
 all: libshmipc.so
 
-# Step 1: 编译 Go 共享库（包含 CGO 导出函数）
-libshmipc_go.so: shmipc_bridge.go
+# Step 1: 下载依赖并生成 go.sum
+go.sum: go.mod
+	$(GO) mod tidy
+	@echo "Generated: go.sum"
+
+# Step 2: 编译 Go 共享库（包含 CGO 导出函数）
+libshmipc_go.so: shmipc_bridge.go go.sum
 	$(GO) build -buildmode=c-shared -o $@ $<
 	@echo "Generated: libshmipc_go.so (Go shared library with CGO exports)"
 
-# Step 2: 编译 C 共享库（链接到 Go 库）
+# Step 3: 编译 C 共享库（链接到 Go 库）
 libshmipc.so: shmipc_preload.c libshmipc_go.so
 	$(CC) $(CFLAGS) -shared -o $@ $< $(LDFLAGS) -L. -lshmipc_go -Wl,-rpath,'$$ORIGIN'
 	@echo ""
@@ -38,7 +43,7 @@ libshmipc.so: shmipc_preload.c libshmipc_go.so
 	@echo ""
 
 clean:
-	rm -f libshmipc.so libshmipc_go.so shmipc_bridge.h
+	rm -f libshmipc.so libshmipc_go.so shmipc_bridge.h go.sum
 
 install: libshmipc.so
 	install -m 755 libshmipc.so /usr/local/lib/
