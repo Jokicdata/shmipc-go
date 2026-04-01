@@ -98,6 +98,7 @@ func ShmipcCreateClientSession(fd C.int, path *C.char) C.int {
 
 	shmConfig := getShmipcConfig(goPath + "_client")
 
+	// 使用正确的 shmipc.Client 函数
 	session, err := shmipc.Client(conn, shmConfig)
 	if err != nil {
 		conn.Close()
@@ -131,6 +132,7 @@ func ShmipcCreateServerSession(fd C.int, path *C.char) C.int {
 
 	shmConfig := getShmipcConfig(goPath + "_server")
 
+	// 使用正确的 shmipc.Server 函数
 	session, err := shmipc.Server(conn, shmConfig)
 	if err != nil {
 		conn.Close()
