@@ -69,6 +69,9 @@ func loadConfig() {
 	}
 
 	if batch := os.Getenv("SHMIPC_BATCH_SIZE"); batch != "" {
+		if b, err := strconv.ParseUint(batch, 10, 32); err == nil {
+			_ = b
+		}
 	}
 
 	logLevel := os.Getenv("SHMIPC_LOG_LEVEL")
@@ -225,8 +228,8 @@ func ShmipcWrite(streamID C.int, data unsafe.Pointer, length C.long) C.long {
 	buf, err := writer.Reserve(int(length))
 	if err != nil {
 		atomic.AddUint64(&perfStats.reserveMisses, 1)
-		buf := C.GoBytes(data, C.int(length))
-		n, err := writer.WriteBytes(buf)
+		fallbackBuf := C.GoBytes(data, C.int(length))
+		n, err := writer.WriteBytes(fallbackBuf)
 		if err != nil {
 			return C.long(-2)
 		}
