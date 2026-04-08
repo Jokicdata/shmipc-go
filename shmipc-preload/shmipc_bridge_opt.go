@@ -14,6 +14,7 @@ package main
 /*
 #include <stdlib.h>
 #include <stdint.h>
+#include <sys/uio.h>
 */
 import "C"
 import (
