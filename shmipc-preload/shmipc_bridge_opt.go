@@ -2,26 +2,27 @@
  * shmipc-bridge - Go CGO 桥接层 (优化版)
  *
  * 关键优化：
- * 1. 零拷贝写：使用 shmipc.Reserve 直接获取 shm buffer，避免 Go bytes 拷贝
- * 2. 零拷贝读：使用 shmipc.BufferReader 直接引用 shm 数据，避免中间 buffer
- * 3. 批量操作：支持累积多次读写再 flush，减少上下文切换
- * 4. Per-FD 锁分离：减少锁竞争
+ * 1. 零拷贝写：使用 shmipc.Reserve 直接获取 shm buffer
+ * 2. 批量操作：支持 writev/readv 减少 flush 次数
  *
  * 编译方式：
- *   go build -buildmode=c-shared -o libshmipc_go.so shmipc_bridge.go
+ *   go build -buildmode=c-shared -o libshmipc_go_opt.so shmipc_bridge_opt.go
  */
 
 package main
 
+/*
+#include <stdlib.h>
+#include <stdint.h>
+*/
+import "C"
 import (
-	"C"
 	"encoding/binary"
 	"fmt"
 	"net"
 	"os"
 	"strconv"
 	"sync"
-	"sync/atomic"
 	"unsafe"
 
 	"github.com/cloudwego/shmipc-go"
@@ -34,39 +35,8 @@ var (
 	config   *shmipc.Config
 )
 
-type streamContext struct {
-	stream     *shmipc.Stream
-	readBuf    []byte
-	writeBuf   []byte
-	readOffset int
-	writeOffset int
-}
-
-type sessionContext struct {
-	session      *shmipc.Session
-	streamCtx    map[int]*streamContext
-	streamCtxMu  sync.RWMutex
-}
-
-var (
-	sessionCtx = make(map[int]*sessionContext)
-	sessionMu  sync.RWMutex
-
-	preAllocBufSize = 2 * 1024 * 1024
-	cPreAllocBuffers []*C.char
-	cPreAllocCount   = 32
-)
-
 func init() {
 	loadConfig()
-	initPreAllocBuffers()
-}
-
-func initPreAllocBuffers() {
-	cPreAllocBuffers = make([]*C.char, cPreAllocCount)
-	for i := range cPreAllocBuffers {
-		cPreAllocBuffers[i] = (*C.char)(C.calloc(1, C.size_t(preAllocBufSize)))
-	}
 }
 
 func loadConfig() {
@@ -109,21 +79,6 @@ func ShmipcCleanup() {
 	}
 	sessions = make(map[int]*shmipc.Session)
 	streams = make(map[int]*shmipc.Stream)
-
-	sessionMu.Lock()
-	for _, ctx := range sessionCtx {
-		ctx.streamCtxMu.Lock()
-		for _, sc := range ctx.streamCtx {
-			if sc.readBuf != nil {
-				C.free(unsafe.Pointer(sc.readBuf))
-			}
-			if sc.writeBuf != nil {
-				C.free(unsafe.Pointer(sc.writeBuf))
-			}
-		}
-	}
-	sessionCtx = make(map[int]*sessionContext)
-	sessionMu.Unlock()
 }
 
 //export ShmipcCreateClientSession
@@ -156,14 +111,6 @@ func ShmipcCreateClientSession(fd C.int, path *C.char) C.int {
 	}
 
 	sessions[int(fd)] = session
-
-	sessionMu.Lock()
-	sessionCtx[int(fd)] = &sessionContext{
-		session:   session,
-		streamCtx: make(map[int]*streamContext),
-	}
-	sessionMu.Unlock()
-
 	return C.int(0)
 }
 
@@ -197,14 +144,6 @@ func ShmipcCreateServerSession(fd C.int, path *C.char) C.int {
 	}
 
 	sessions[int(fd)] = session
-
-	sessionMu.Lock()
-	sessionCtx[int(fd)] = &sessionContext{
-		session:   session,
-		streamCtx: make(map[int]*streamContext),
-	}
-	sessionMu.Unlock()
-
 	return C.int(0)
 }
 
@@ -229,20 +168,6 @@ func ShmipcOpenStream(fd C.int) C.int {
 	streams[streamID] = stream
 	mu.Unlock()
 
-	sessionMu.Lock()
-	if ctx, ok := sessionCtx[int(fd)]; ok {
-		ctx.streamCtxMu.Lock()
-		ctx.streamCtx[streamID] = &streamContext{
-			stream:      stream,
-			readBuf:     nil,
-			writeBuf:    nil,
-			readOffset:  0,
-			writeOffset: 0,
-		}
-		ctx.streamCtxMu.Unlock()
-	}
-	sessionMu.Unlock()
-
 	return C.int(streamID)
 }
 
@@ -266,20 +191,6 @@ func ShmipcAcceptStream(fd C.int) C.int {
 	mu.Lock()
 	streams[streamID] = stream
 	mu.Unlock()
-
-	sessionMu.Lock()
-	if ctx, ok := sessionCtx[int(fd)]; ok {
-		ctx.streamCtxMu.Lock()
-		ctx.streamCtx[streamID] = &streamContext{
-			stream:      stream,
-			readBuf:     nil,
-			writeBuf:    nil,
-			readOffset:  0,
-			writeOffset: 0,
-		}
-		ctx.streamCtxMu.Unlock()
-	}
-	sessionMu.Unlock()
 
 	return C.int(streamID)
 }
@@ -369,7 +280,7 @@ func ShmipcWriteVectored(streamID C.int, iovec *C.struct_iovec, iovcnt C.int) C.
 }
 
 //export ShmipcRead
-// 优化版本：使用 BufferReader 直接引用 shm 数据
+// 优化版本：直接读取数据
 func ShmipcRead(streamID C.int, data unsafe.Pointer, length C.long) C.long {
 	mu.RLock()
 	stream, exists := streams[int(streamID)]
@@ -398,7 +309,7 @@ func ShmipcRead(streamID C.int, data unsafe.Pointer, length C.long) C.long {
 }
 
 //export ShmipcReadVectored
-// 优化版本：批量读，减少系统调用次数
+// 优化版本：批量读
 func ShmipcReadVectored(streamID C.int, iovec *C.struct_iovec, iovcnt C.int) C.long {
 	mu.RLock()
 	stream, exists := streams[int(streamID)]
@@ -460,23 +371,6 @@ func ShmipcCloseStream(streamID C.int) C.int {
 	}
 
 	err := stream.Close()
-
-	sessionMu.Lock()
-	for _, ctx := range sessionCtx {
-		ctx.streamCtxMu.Lock()
-		if sc, ok := ctx.streamCtx[int(streamID)]; ok {
-			if sc.readBuf != nil {
-				C.free(unsafe.Pointer(&sc.readBuf[0]))
-			}
-			if sc.writeBuf != nil {
-				C.free(unsafe.Pointer(&sc.writeBuf[0]))
-			}
-			delete(ctx.streamCtx, int(streamID))
-		}
-		ctx.streamCtxMu.Unlock()
-	}
-	sessionMu.Unlock()
-
 	if err != nil {
 		return C.int(-2)
 	}
@@ -497,23 +391,7 @@ func ShmipcCloseSession(fd C.int) C.int {
 		return C.int(-1)
 	}
 
-	sessionMu.Lock()
-	if ctx, ok := sessionCtx[int(fd)]; ok {
-		ctx.streamCtxMu.Lock()
-		for _, sc := range ctx.streamCtx {
-			if sc.readBuf != nil {
-				C.free(unsafe.Pointer(&sc.readBuf[0]))
-			}
-			if sc.writeBuf != nil {
-				C.free(unsafe.Pointer(&sc.writeBuf[0]))
-			}
-		}
-		delete(sessionCtx, int(fd))
-	}
-	sessionMu.Unlock()
-
 	err := session.Close()
-
 	if err != nil {
 		return C.int(-2)
 	}
@@ -538,7 +416,7 @@ func ShmipcGetStats(stats unsafe.Pointer) C.int {
 
 	s := Stats{
 		TotalConnections:  uint64(len(sessions)),
-		ShmipcConnections:  uint64(len(sessions)),
+		ShmipcConnections: uint64(len(sessions)),
 	}
 
 	buf := make([]byte, 56)
@@ -574,47 +452,7 @@ func ShmipcFlush(streamID C.int) C.int {
 	return C.int(0)
 }
 
-//export ShmipcSetWriteDeadline
-// 设置写超时
-func ShmipcSetWriteDeadline(streamID C.int, timeoutMs C.long) C.int {
-	mu.RLock()
-	stream, exists := streams[int(streamID)]
-	mu.RUnlock()
-
-	if !exists || stream == nil {
-		return C.int(-1)
-	}
-
-	if timeoutMs > 0 {
-		stream.SetWriteDeadline(0)
-	} else {
-		stream.SetWriteDeadline(0)
-	}
-
-	return C.int(0)
-}
-
-//export ShmipcSetReadDeadline
-// 设置读超时
-func ShmipcSetReadDeadline(streamID C.int, timeoutMs C.long) C.int {
-	mu.RLock()
-	stream, exists := streams[int(streamID)]
-	mu.RUnlock()
-
-	if !exists || stream == nil {
-		return C.int(-1)
-	}
-
-	if timeoutMs > 0 {
-		stream.SetReadDeadline(0)
-	} else {
-		stream.SetReadDeadline(0)
-	}
-
-	return C.int(0)
-}
-
 func main() {
-	fmt.Println("shmipc-bridge: This is a shared library")
-	fmt.Println("Usage: LD_PRELOAD=./libshmipc.so <your-program>")
+	fmt.Println("shmipc-bridge-opt: This is a shared library")
+	fmt.Println("Usage: LD_PRELOAD=./libshmipc_opt.so <your-program>")
 }
