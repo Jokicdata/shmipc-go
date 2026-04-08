@@ -1,0 +1,221 @@
+#!/usr/bin/bpftrace
+/*
+ * shmipc-preload eBPF 追踪脚本
+ * 
+ * 功能：追踪 shmipc-preload 各函数的耗时分布
+ * 
+ * 使用方法：
+ *   sudo bpftrace shmipc_trace.bt
+ * 
+ * 输出：
+ *   - 各函数耗时直方图
+ *   - 调用次数统计
+ *   - 平均耗时
+ */
+
+BEGIN
+{
+    printf("========================================\n");
+    printf("  shmipc-preload eBPF 追踪\n");
+    printf("========================================\n");
+    printf("按 Ctrl+C 结束追踪\n\n");
+}
+
+/* ========== 追踪 ShmipcWrite 函数 ========== */
+uprobe:/usr/local/lib/libshmipc_go.so:ShmipcWrite
+{
+    @write_start[tid] = nsecs;
+    @write_count = count();
+}
+
+uretprobe:/usr/local/lib/libshmipc_go.so:ShmipcWrite
+/@write_start[tid]/
+{
+    @write_ns = hist(nsecs - @write_start[tid]);
+    @write_total_ns = sum(nsecs - @write_start[tid]);
+    delete(@write_start[tid]);
+}
+
+/* ========== 追踪 ShmipcRead 函数 ========== */
+uprobe:/usr/local/lib/libshmipc_go.so:ShmipcRead
+{
+    @read_start[tid] = nsecs;
+    @read_count = count();
+}
+
+uretprobe:/usr/local/lib/libshmipc_go.so:ShmipcRead
+/@read_start[tid]/
+{
+    @read_ns = hist(nsecs - @read_start[tid]);
+    @read_total_ns = sum(nsecs - @read_start[tid]);
+    delete(@read_start[tid]);
+}
+
+/* ========== 追踪 ShmipcOpenStream 函数 ========== */
+uprobe:/usr/local/lib/libshmipc_go.so:ShmipcOpenStream
+{
+    @open_stream_start[tid] = nsecs;
+    @open_stream_count = count();
+}
+
+uretprobe:/usr/local/lib/libshmipc_go.so:ShmipcOpenStream
+/@open_stream_start[tid]/
+{
+    @open_stream_ns = hist(nsecs - @open_stream_start[tid]);
+    @open_stream_total_ns = sum(nsecs - @open_stream_start[tid]);
+    delete(@open_stream_start[tid]);
+}
+
+/* ========== 追踪 ShmipcAcceptStream 函数 ========== */
+uprobe:/usr/local/lib/libshmipc_go.so:ShmipcAcceptStream
+{
+    @accept_stream_start[tid] = nsecs;
+    @accept_stream_count = count();
+}
+
+uretprobe:/usr/local/lib/libshmipc_go.so:ShmipcAcceptStream
+/@accept_stream_start[tid]/
+{
+    @accept_stream_ns = hist(nsecs - @accept_stream_start[tid]);
+    @accept_stream_total_ns = sum(nsecs - @accept_stream_start[tid]);
+    delete(@accept_stream_start[tid]);
+}
+
+/* ========== 追踪 ShmipcCreateClientSession 函数 ========== */
+uprobe:/usr/local/lib/libshmipc_go.so:ShmipcCreateClientSession
+{
+    @create_client_start[tid] = nsecs;
+    @create_client_count = count();
+}
+
+uretprobe:/usr/local/lib/libshmipc_go.so:ShmipcCreateClientSession
+/@create_client_start[tid]/
+{
+    @create_client_ns = hist(nsecs - @create_client_start[tid]);
+    @create_client_total_ns = sum(nsecs - @create_client_start[tid]);
+    delete(@create_client_start[tid]);
+}
+
+/* ========== 追踪 ShmipcCreateServerSession 函数 ========== */
+uprobe:/usr/local/lib/libshmipc_go.so:ShmipcCreateServerSession
+{
+    @create_server_start[tid] = nsecs;
+    @create_server_count = count();
+}
+
+uretprobe:/usr/local/lib/libshmipc_go.so:ShmipcCreateServerSession
+/@create_server_start[tid]/
+{
+    @create_server_ns = hist(nsecs - @create_server_start[tid]);
+    @create_server_total_ns = sum(nsecs - @create_server_start[tid]);
+    delete(@create_server_start[tid]);
+}
+
+/* ========== 追踪 memcpy 函数（分析内存拷贝开销） ========== */
+uprobe:libc.so.6:memcpy
+/pid == ${PID}/
+{
+    @memcpy_start[tid] = nsecs;
+    @memcpy_count = count();
+}
+
+uretprobe:libc.so.6:memcpy
+/@memcpy_start[tid]/
+{
+    @memcpy_ns = hist(nsecs - @memcpy_start[tid]);
+    @memcpy_total_ns = sum(nsecs - @memcpy_start[tid]);
+    delete(@memcpy_start[tid]);
+}
+
+/* ========== 追踪 CGO 调用开销 ========== */
+uprobe:/usr/local/lib/libshmipc_go.so:*
+/call(@write_start[tid]) || @read_start[tid]/
+{
+    @cgo_calls = count();
+}
+
+/* ========== 输出统计信息 ========== */
+interval:s:5
+{
+    printf("\n========================================\n");
+    printf("  统计信息 (每 5 秒)\n");
+    printf("========================================\n");
+    
+    printf("\n[ShmipcWrite]\n");
+    print(@write_count);
+    print(@write_ns);
+    
+    printf("\n[ShmipcRead]\n");
+    print(@read_count);
+    print(@read_ns);
+    
+    printf("\n[ShmipcOpenStream]\n");
+    print(@open_stream_count);
+    print(@open_stream_ns);
+    
+    printf("\n[ShmipcAcceptStream]\n");
+    print(@accept_stream_count);
+    print(@accept_stream_ns);
+    
+    printf("\n[ShmipcCreateClientSession]\n");
+    print(@create_client_count);
+    print(@create_client_ns);
+    
+    printf("\n[ShmipcCreateServerSession]\n");
+    print(@create_server_count);
+    print(@create_server_ns);
+    
+    printf("\n[memcpy (内存拷贝)]\n");
+    print(@memcpy_count);
+    print(@memcpy_ns);
+}
+
+/* ========== 结束时输出汇总 ========== */
+END
+{
+    printf("\n========================================\n");
+    printf("  最终统计汇总\n");
+    printf("========================================\n");
+    
+    printf("\n[ShmipcWrite 耗时分布]\n");
+    print(@write_ns);
+    printf("总调用次数: "); print(@write_count);
+    printf("总耗时 (ns): "); print(@write_total_ns);
+    
+    printf("\n[ShmipcRead 耗时分布]\n");
+    print(@read_ns);
+    printf("总调用次数: "); print(@read_count);
+    printf("总耗时 (ns): "); print(@read_total_ns);
+    
+    printf("\n[ShmipcOpenStream 耗时分布]\n");
+    print(@open_stream_ns);
+    printf("总调用次数: "); print(@open_stream_count);
+    printf("总耗时 (ns): "); print(@open_stream_total_ns);
+    
+    printf("\n[ShmipcAcceptStream 耗时分布]\n");
+    print(@accept_stream_ns);
+    printf("总调用次数: "); print(@accept_stream_count);
+    printf("总耗时 (ns): "); print(@accept_stream_total_ns);
+    
+    printf("\n[ShmipcCreateClientSession 耗时分布]\n");
+    print(@create_client_ns);
+    printf("总调用次数: "); print(@create_client_count);
+    printf("总耗时 (ns): "); print(@create_client_total_ns);
+    
+    printf("\n[ShmipcCreateServerSession 耗时分布]\n");
+    print(@create_server_ns);
+    printf("总调用次数: "); print(@create_server_count);
+    printf("总耗时 (ns): "); print(@create_server_total_ns);
+    
+    printf("\n[memcpy 耗时分布 (内存拷贝开销)]\n");
+    print(@memcpy_ns);
+    printf("总调用次数: "); print(@memcpy_count);
+    printf("总耗时 (ns): "); print(@memcpy_total_ns);
+    
+    printf("\n========================================\n");
+    printf("  分析建议\n");
+    printf("========================================\n");
+    printf("1. 如果 memcpy 耗时占比较高，说明内存拷贝是瓶颈\n");
+    printf("2. 如果 ShmipcWrite/ShmipcRead 耗时高，检查共享内存操作\n");
+    printf("3. 如果 CGO 调用次数过多，考虑批量处理\n");
+}
