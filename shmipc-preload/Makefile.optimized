@@ -1,0 +1,72 @@
+CC = gcc
+GO = go
+CFLAGS = -O2 -Wall -Wextra -fPIC -shared
+GOFLAGS = -buildmode=c-shared
+
+LIB_NAME = shmipc
+LIB_ORIG = lib$(LIB_NAME).so
+LIB_OPT = lib$(LIB_NAME)_optimized.so
+LIB_GO = lib$(LIB_NAME)_go.so
+LIB_GO_OPT = lib$(LIB_NAME)_go_optimized.so
+
+.PHONY: all clean install help original optimized
+
+all: original optimized
+
+original: $(LIB_ORIG)
+
+optimized: $(LIB_OPT)
+
+$(LIB_GO): shmipc_bridge.go
+	go build $(GOFLAGS) -o $@ $<
+
+$(LIB_ORIG): $(LIB_GO) shmipc_preload.c
+	$(CC) $(CFLAGS) -o $@ shmipc_preload.c -L. -l$(LIB_NAME)_go -lpthread -ldl
+
+$(LIB_GO_OPT): shmipc_bridge_optimized.go
+	go build $(GOFLAGS) -o $@ $<
+
+$(LIB_OPT): $(LIB_GO_OPT) shmipc_preload_optimized.c
+	$(CC) $(CFLAGS) -o $@ shmipc_preload_optimized.c -L. -l$(LIB_NAME)_go_optimized -lpthread -ldl
+
+install: all
+	@echo "Installing libraries..."
+	install -d $(DESTDIR)/usr/local/lib
+	install -m 755 $(LIB_ORIG) $(DESTDIR)/usr/local/lib/
+	install -m 755 $(LIB_OPT) $(DESTDIR)/usr/local/lib/
+	install -m 755 $(LIB_GO) $(DESTDIR)/usr/local/lib/
+	install -m 755 $(LIB_GO_OPT) $(DESTDIR)/usr/local/lib/
+	ldconfig
+
+clean:
+	rm -f $(LIB_ORIG) $(LIB_OPT) $(LIB_GO) $(LIB_GO_OPT)
+	rm -f *.h
+	rm -rf trace_results perf_results benchmark_results latency_results
+
+help:
+	@echo "shmipc-preload Makefile"
+	@echo ""
+	@echo "Targets:"
+	@echo "  all        - Build both original and optimized versions (default)"
+	@echo "  original   - Build original version only"
+	@echo "  optimized  - Build optimized version only"
+	@echo "  install    - Install libraries to /usr/local/lib"
+	@echo "  clean      - Remove all build artifacts"
+	@echo "  help       - Show this help message"
+	@echo ""
+	@echo "Output files:"
+	@echo "  $(LIB_ORIG)     - Original preload library"
+	@echo "  $(LIB_OPT)      - Optimized preload library"
+	@echo "  $(LIB_GO)       - Original Go shared library"
+	@echo "  $(LIB_GO_OPT)   - Optimized Go shared library"
+	@echo ""
+	@echo "Usage:"
+	@echo "  LD_PRELOAD=./$(LIB_ORIG) <program>     # Use original version"
+	@echo "  LD_PRELOAD=./$(LIB_OPT) <program>      # Use optimized version"
+	@echo ""
+	@echo "Environment variables:"
+	@echo "  SHMIPC_BUFFER_SIZE  - Shared memory buffer size (default: 256MB)"
+	@echo "  SHMIPC_QUEUE_CAP    - Queue capacity (default: 8192)"
+	@echo "  SHMIPC_BATCH_IO     - Enable batch I/O (default: 1)"
+	@echo "  SHMIPC_LOG          - Log level (0-4, default: 1)"
+	@echo "  SHMIPC_ENABLE       - Enable shmipc (default: 1)"
