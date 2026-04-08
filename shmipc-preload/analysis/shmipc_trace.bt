@@ -1,18 +1,103 @@
 #!/usr/bin/bpftrace
 /*
+ * ============================================================================
  * shmipc-preload eBPF 追踪脚本
+ * ============================================================================
  * 
- * 功能：追踪 shmipc-preload 各函数的耗时分布
+ * 【脚本功能】
+ * 本脚本使用 eBPF (extended Berkeley Packet Filter) 技术追踪 shmipc-preload 
+ * 各函数的耗时分布，帮助定位性能瓶颈。
  * 
- * 使用方法：
+ * 主要功能：
+ *   1. 追踪 ShmipcWrite/ShmipcRead 函数耗时
+ *   2. 追踪 ShmipcOpenStream/ShmipcAcceptStream 函数耗时
+ *   3. 追踪 ShmipcCreateClientSession/ShmipcCreateServerSession 函数耗时
+ *   4. 追踪 memcpy 函数耗时（分析内存拷贝开销）
+ *   5. 输出耗时直方图和统计信息
+ * 
+ * 【使用方法】
  *   sudo bpftrace shmipc_trace.bt
+ *   sudo bpftrace -e 'pid:$1' shmipc_trace.bt <pid>
  * 
- * 输出：
+ * 【输出结果】
  *   - 各函数耗时直方图
  *   - 调用次数统计
  *   - 平均耗时
+ *   - 总耗时
+ * 
+ * 【依赖工具】
+ *   - bpftrace: eBPF 追踪工具
+ *   - root 权限
+ * 
+ * 【作者】shmipc-preload 分析工具
+ * 【版本】1.0
+ * ============================================================================
  */
 
+/*
+ * ============================================================================
+ * eBPF 基础语法说明
+ * ============================================================================
+ * 
+ * 1. 探针类型：
+ *    - uprobe: 用户态函数入口探针
+ *      语法：uprobe:库路径:函数名
+ *      示例：uprobe:/usr/local/lib/libshmipc_go.so:ShmipcWrite
+ *    
+ *    - uretprobe: 用户态函数返回探针
+ *      语法：uretprobe:库路径:函数名
+ *      示例：uretprobe:/usr/local/lib/libshmipc_go.so:ShmipcWrite
+ *    
+ *    - kprobe: 内核函数入口探针
+ *      语法：kprobe:内核函数名
+ *      示例：kprobe:do_sys_open
+ *    
+ *    - kretprobe: 内核函数返回探针
+ *      语法：kretprobe:内核函数名
+ *      示例：kretprobe:do_sys_open
+ * 
+ * 2. 内置变量：
+ *    - pid:  进程 ID
+ *    - tid:  线程 ID
+ *    - uid:  用户 ID
+ *    - gid:  组 ID
+ *    - comm: 进程名
+ *    - nsecs: 纳秒时间戳
+ *    - retval: 返回值（仅 kretprobe/uretprobe）
+ *    - arg0, arg1, ...: 函数参数
+ * 
+ * 3. Map 类型：
+ *    - @name[key]: 普通 Map，存储单个值
+ *    - @name: 无 key 的 Map，存储全局统计
+ *    - hist(): 直方图函数
+ *    - count(): 计数函数
+ *    - sum(): 求和函数
+ *    - min(): 最小值函数
+ *    - max(): 最大值函数
+ * 
+ * 4. 控制语句：
+ *    - if (condition) { ... }
+ *    - /condition/ { ... }  // 过滤器
+ *    - while (condition) { ... }
+ * 
+ * 5. 特殊语法：
+ *    - BEGIN { ... }: 脚本开始时执行
+ *    - END { ... }: 脚本结束时执行
+ *    - interval:s:N { ... }: 每 N 秒执行一次
+ *    - delete(@map[key]): 删除 Map 中的元素
+ *    - clear(@map): 清空 Map
+ *    - print(@map): 打印 Map 内容
+ * ============================================================================
+ */
+
+/*
+ * ============================================================================
+ * BEGIN 块：脚本初始化
+ * ============================================================================
+ * 
+ * BEGIN 块在脚本开始执行时运行一次，用于初始化和打印提示信息。
+ * ============================================================================
+ */
 BEGIN
 {
     printf("========================================\n");
@@ -21,13 +106,66 @@ BEGIN
     printf("按 Ctrl+C 结束追踪\n\n");
 }
 
-/* ========== 追踪 ShmipcWrite 函数 ========== */
+/*
+ * ============================================================================
+ * 追踪 ShmipcWrite 函数
+ * ============================================================================
+ * 
+ * ShmipcWrite 是 shmipc-preload 的核心写入函数，用于将数据写入共享内存。
+ * 通过追踪这个函数的耗时，可以分析写入操作的性能瓶颈。
+ * ============================================================================
+ */
+
+/*
+ * ---------------------------------------------------------------------------
+ * uprobe: 函数入口探针
+ * 
+ * 当 ShmipcWrite 函数被调用时，记录当前时间戳。
+ * 
+ * 语法说明：
+ *   uprobe:/usr/local/lib/libshmipc_go.so:ShmipcWrite
+ *     - uprobe: 用户态函数入口探针
+ *     - /usr/local/lib/libshmipc_go.so: 目标库路径
+ *     - ShmipcWrite: 目标函数名
+ *   
+ *   @write_start[tid] = nsecs;
+ *     - @write_start: Map 名称，用于存储开始时间
+ *     - [tid]: 以线程 ID 为 key，确保多线程环境下数据正确
+ *     - nsecs: 当前纳秒时间戳
+ *   
+ *   @write_count = count();
+ *     - @write_count: Map 名称，用于统计调用次数
+ *     - count(): 计数函数，每次调用加 1
+ * ---------------------------------------------------------------------------
+ */
 uprobe:/usr/local/lib/libshmipc_go.so:ShmipcWrite
 {
     @write_start[tid] = nsecs;
     @write_count = count();
 }
 
+/*
+ * ---------------------------------------------------------------------------
+ * uretprobe: 函数返回探针
+ * 
+ * 当 ShmipcWrite 函数返回时，计算耗时并记录。
+ * 
+ * 语法说明：
+ *   /@write_start[tid]/
+ *     - 这是过滤器，只有当 @write_start[tid] 存在时才执行
+ *     - 防止在函数入口探针未触发时计算错误耗时
+ *   
+ *   @write_ns = hist(nsecs - @write_start[tid]);
+ *     - hist(): 直方图函数，自动将数值分桶统计
+ *     - nsecs - @write_start[tid]: 计算耗时（纳秒）
+ *   
+ *   @write_total_ns = sum(nsecs - @write_start[tid]);
+ *     - sum(): 求和函数，累计总耗时
+ *   
+ *   delete(@write_start[tid]);
+ *     - delete(): 删除 Map 中的元素，释放内存
+ * ---------------------------------------------------------------------------
+ */
 uretprobe:/usr/local/lib/libshmipc_go.so:ShmipcWrite
 /@write_start[tid]/
 {
@@ -36,7 +174,14 @@ uretprobe:/usr/local/lib/libshmipc_go.so:ShmipcWrite
     delete(@write_start[tid]);
 }
 
-/* ========== 追踪 ShmipcRead 函数 ========== */
+/*
+ * ============================================================================
+ * 追踪 ShmipcRead 函数
+ * ============================================================================
+ * 
+ * ShmipcRead 是 shmipc-preload 的核心读取函数，用于从共享内存读取数据。
+ * ============================================================================
+ */
 uprobe:/usr/local/lib/libshmipc_go.so:ShmipcRead
 {
     @read_start[tid] = nsecs;
@@ -51,7 +196,14 @@ uretprobe:/usr/local/lib/libshmipc_go.so:ShmipcRead
     delete(@read_start[tid]);
 }
 
-/* ========== 追踪 ShmipcOpenStream 函数 ========== */
+/*
+ * ============================================================================
+ * 追踪 ShmipcOpenStream 函数
+ * ============================================================================
+ * 
+ * ShmipcOpenStream 用于打开一个新的 Stream，是连接建立后的初始化操作。
+ * ============================================================================
+ */
 uprobe:/usr/local/lib/libshmipc_go.so:ShmipcOpenStream
 {
     @open_stream_start[tid] = nsecs;
@@ -66,7 +218,14 @@ uretprobe:/usr/local/lib/libshmipc_go.so:ShmipcOpenStream
     delete(@open_stream_start[tid]);
 }
 
-/* ========== 追踪 ShmipcAcceptStream 函数 ========== */
+/*
+ * ============================================================================
+ * 追踪 ShmipcAcceptStream 函数
+ * ============================================================================
+ * 
+ * ShmipcAcceptStream 用于服务端接受客户端的 Stream 连接。
+ * ============================================================================
+ */
 uprobe:/usr/local/lib/libshmipc_go.so:ShmipcAcceptStream
 {
     @accept_stream_start[tid] = nsecs;
@@ -81,7 +240,14 @@ uretprobe:/usr/local/lib/libshmipc_go.so:ShmipcAcceptStream
     delete(@accept_stream_start[tid]);
 }
 
-/* ========== 追踪 ShmipcCreateClientSession 函数 ========== */
+/*
+ * ============================================================================
+ * 追踪 ShmipcCreateClientSession 函数
+ * ============================================================================
+ * 
+ * ShmipcCreateClientSession 用于客户端创建 Session，是客户端初始化操作。
+ * ============================================================================
+ */
 uprobe:/usr/local/lib/libshmipc_go.so:ShmipcCreateClientSession
 {
     @create_client_start[tid] = nsecs;
@@ -96,7 +262,14 @@ uretprobe:/usr/local/lib/libshmipc_go.so:ShmipcCreateClientSession
     delete(@create_client_start[tid]);
 }
 
-/* ========== 追踪 ShmipcCreateServerSession 函数 ========== */
+/*
+ * ============================================================================
+ * 追踪 ShmipcCreateServerSession 函数
+ * ============================================================================
+ * 
+ * ShmipcCreateServerSession 用于服务端创建 Session，是服务端初始化操作。
+ * ============================================================================
+ */
 uprobe:/usr/local/lib/libshmipc_go.so:ShmipcCreateServerSession
 {
     @create_server_start[tid] = nsecs;
@@ -111,7 +284,18 @@ uretprobe:/usr/local/lib/libshmipc_go.so:ShmipcCreateServerSession
     delete(@create_server_start[tid]);
 }
 
-/* ========== 追踪 memcpy 函数（分析内存拷贝开销） ========== */
+/*
+ * ============================================================================
+ * 追踪 memcpy 函数（分析内存拷贝开销）
+ * ============================================================================
+ * 
+ * memcpy 是 C 标准库的内存拷贝函数，在 shmipc-preload 中被大量使用。
+ * 追踪 memcpy 的耗时可以分析内存拷贝是否是性能瓶颈。
+ * 
+ * 注意：这里追踪的是 libc.so.6 中的 memcpy 函数。
+ * /pid == ${PID}/ 是过滤器，只追踪指定进程。
+ * ============================================================================
+ */
 uprobe:libc.so.6:memcpy
 /pid == ${PID}/
 {
@@ -127,14 +311,15 @@ uretprobe:libc.so.6:memcpy
     delete(@memcpy_start[tid]);
 }
 
-/* ========== 追踪 CGO 调用开销 ========== */
-uprobe:/usr/local/lib/libshmipc_go.so:*
-/call(@write_start[tid]) || @read_start[tid]/
-{
-    @cgo_calls = count();
-}
-
-/* ========== 输出统计信息 ========== */
+/*
+ * ============================================================================
+ * 定期输出统计信息
+ * ============================================================================
+ * 
+ * interval:s:5 表示每 5 秒执行一次。
+ * 用于实时监控性能数据，而不是等到脚本结束才输出。
+ * ============================================================================
+ */
 interval:s:5
 {
     printf("\n========================================\n");
@@ -170,7 +355,14 @@ interval:s:5
     print(@memcpy_ns);
 }
 
-/* ========== 结束时输出汇总 ========== */
+/*
+ * ============================================================================
+ * END 块：脚本结束时输出汇总
+ * ============================================================================
+ * 
+ * END 块在脚本结束（按 Ctrl+C）时执行，输出最终的统计汇总。
+ * ============================================================================
+ */
 END
 {
     printf("\n========================================\n");
