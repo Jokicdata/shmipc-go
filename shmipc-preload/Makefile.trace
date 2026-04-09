@@ -1,0 +1,38 @@
+CC = gcc
+GO = go
+CFLAGS = -Wall -Wextra -fPIC -O2
+LDFLAGS = -shared -ldl -lpthread
+
+.PHONY: all clean trace trace-clean
+
+all: libshmipc_trace.so
+
+# 编译追踪版 Go 共享库
+libshmipc_go_trace.so: shmipc_bridge_trace.go go.mod go.sum
+	$(GO) build -buildmode=c-shared -o $@ $<
+	@echo "Generated: libshmipc_go_trace.so (Trace version)"
+
+# 编译追踪版 C 共享库
+libshmipc_trace.so: shmipc_preload_opt.c libshmipc_go_trace.so
+	$(CC) $(CFLAGS) -shared -o $@ $< $(LDFLAGS) -L. -lshmipc_go_trace -Wl,-rpath,'$$ORIGIN'
+	@echo ""
+	@echo "=========================================="
+	@echo "Trace Build Complete!"
+	@echo "=========================================="
+	@echo ""
+	@echo "Generated: libshmipc_trace.so"
+	@echo ""
+	@echo "Usage:"
+	@echo "  1. Server: SHMIPC_TRACE=1 LD_PRELOAD=./libshmipc_trace.so qperf"
+	@echo "  2. Client: SHMIPC_TRACE=1 LD_PRELOAD=./libshmipc_trace.so qperf 127.0.0.1 -m 8192 -t 10"
+	@echo ""
+	@echo "View trace:"
+	@echo "  tail -f /tmp/shmipc_trace.log"
+
+clean:
+	rm -f libshmipc_trace.so libshmipc_go_trace.so
+
+trace: libshmipc_trace.so
+
+trace-clean:
+	rm -f libshmipc_trace.so libshmipc_go_trace.so
