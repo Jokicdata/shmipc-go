@@ -440,7 +440,19 @@ cd /sys/kernel/debug/tracing
 echo 0 > tracing_on           # 先停止
 echo > trace                  # 清空旧数据
 echo function_graph > current_tracer   # 使用函数图追踪器
-echo 1 > tracing_on           # 开始追踪
+
+# 可选：只追踪 shmipc/qperf 相关函数（减少数据量）
+echo '*shmipc*' > set_graph_function
+echo '*qperf*' >> set_graph_function
+
+# 可选：显示函数执行时长（默认已开启）
+echo 1 > options/funcgraph-duration
+
+# 可选：显示绝对时间戳
+echo 1 > options/funcgraph-abstime
+
+# 开始追踪
+echo 1 > tracing_on
 
 # Terminal 3: 运行 qperf client
 LD_PRELOAD=./libshmipc.so qperf 127.0.0.1 -msg_size 524288 -t 60 tcp_bw tcp_lat

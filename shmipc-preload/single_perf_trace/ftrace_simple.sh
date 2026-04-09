@@ -35,7 +35,19 @@ cd "$TRACE_DIR"
 
 echo 0 > tracing_on        # 先停止
 echo > trace              # 清空
+
 echo function_graph > current_tracer    # 使用函数图追踪器
+
+# 可选：只追踪 shmipc 相关函数
+echo '*shmipc*' > set_graph_function 2>/dev/null || true
+echo '*qperf*' >> set_graph_function 2>/dev/null || true
+
+# 可选：显示函数执行时长（默认已开启）
+echo 1 > options/funcgraph-duration 2>/dev/null || true
+
+# 可选：显示绝对时间戳
+echo 1 > options/funcgraph-abstime 2>/dev/null || true
+
 echo 1 > tracing_on        # 开始追踪
 
 echo "    ftrace 已启用，${DURATION}秒后自动停止..."
