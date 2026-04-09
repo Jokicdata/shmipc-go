@@ -422,18 +422,114 @@ sudo perf report --stdio -g none -i perf.data | head -100
 
 ---
 
+## 附录：ftrace 最简用法（推荐）
+
+如果只需要简单查看函数调用时间，不需要复杂的分析脚本，可以用这个最简方法。
+
+### 使用方式
+
+**需要 3 个终端配合**：
+
+```bash
+# Terminal 1: 启动 qperf server
+cd /path/to/shmipc-preload
+LD_PRELOAD=./libshmipc.so qperf
+
+# Terminal 2: 启用 ftrace 追踪（qperf 运行时执行）
+cd /sys/kernel/debug/tracing
+echo 0 > tracing_on           # 先停止
+echo > trace                  # 清空旧数据
+echo function_graph > current_tracer   # 使用函数图追踪器
+echo 1 > tracing_on           # 开始追踪
+
+# Terminal 3: 运行 qperf client
+LD_PRELOAD=./libshmipc.so qperf 127.0.0.1 -msg_size 524288 -t 60 tcp_bw tcp_lat
+
+# qperf 结束后，Terminal 2 查看结果
+echo 0 > tracing_on           # 停止追踪
+cat trace                     # 查看结果
+```
+
+### 或使用简化脚本
+
+```bash
+# Terminal 1: 启动 qperf server
+LD_PRELOAD=./libshmipc.so qperf
+
+# Terminal 2: 运行简化脚本（会等待 60 秒）
+cd /path/to/shmipc-preload/single_perf_trace
+chmod +x ftrace_simple.sh
+sudo ./ftrace_simple.sh 60
+
+# Terminal 3: qperf client（需要在脚本运行期间执行）
+LD_PRELOAD=./libshmipc.so qperf 127.0.0.1 -msg_size 524288 -t 60 tcp_bw tcp_lat
+```
+
+### ftrace 输出示例
+
+启用后会看到类似输出：
+
+```
+# tracer: function_graph
+#
+# CPU  CPU  FUNCTION CALLS              (DURATION)
+# |     |       |                       |         |
+  0)               qperf_() {
+  0)               |  ShmipcWrite() {
+  0)               |    |  shmipc_write_bytes() {
+  0)               |    |    |  runtime.slicecopy() {
+  0)               |    |    |    |  memcpy() {
+  0)               |    |    |    |    0.050 us
+  0)               |    |    |    |  }
+  0)               |    |    |    0.080 us
+  0)               |    |    |  }
+  0)               |    |    0.150 us
+  0)               |    |  }
+  0)               |    0.200 us
+  0)               |  }
+```
+
+### 常用命令
+
+```bash
+# 只看包含 shmipc 的行
+grep -i shmipc /sys/kernel/debug/tracing/trace
+
+# 只看函数调用
+grep "funcgraph_entry" /sys/kernel/debug/tracing/trace | head -50
+
+# 只看函数返回（带执行时间）
+grep "funcgraph_exit" /sys/kernel/debug/tracing/trace | head -50
+
+# 看所有函数并统计调用次数
+grep "funcgraph_entry" /sys/kernel/debug/tracing/trace | awk '{print $8}' | sort | uniq -c | sort -rn | head -20
+```
+
+### 注意事项
+
+1. **需要 root 权限**：`sudo` 或 root 用户
+2. **ftrace 目录**：`/sys/kernel/debug/tracing`
+3. **追踪时间**：echo 1 > tracing_on 后就开始记录，直到 echo 0 > tracing_on
+4. **数据量**：长时间追踪会产生大量数据，建议 30-120 秒即可
+
+---
+
 ## 脚本文件清单
 
 ```
 single_perf_trace/
-├── ftrace_analyze.sh      # ftrace 分析脚本
-└── README.md              # 本文档
+├── ftrace_analyze.sh       # 详细 ftrace 分析脚本
+├── ftrace_simple.sh        # ftrace 最简用法脚本
+├── run_perf_analysis.sh    # perf + 火焰图分析
+├── run_all.sh              # 一键运行所有分析
+└── README.md               # 本文档
 ```
 
-如需运行分析：
+### 快速选择
 
-```bash
-cd /path/to/shmipc-preload/single_perf_trace
-chmod +x ftrace_analyze.sh
-sudo ./ftrace_analyze.sh 60
-```
+| 需求 | 推荐脚本 |
+|------|---------|
+| 只要看函数调用和时间 | `ftrace_simple.sh` |
+| 需要详细分析报告 | `ftrace_analyze.sh` |
+| 需要火焰图 | `run_perf_analysis.sh` |
+| 全部都要 | `run_all.sh` |
