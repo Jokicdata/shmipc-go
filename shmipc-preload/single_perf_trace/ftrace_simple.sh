@@ -38,9 +38,9 @@ echo > trace              # 清空
 
 echo function_graph > current_tracer    # 使用函数图追踪器
 
-# 可选：只追踪 shmipc 相关函数
-echo '*shmipc*' > set_graph_function 2>/dev/null || true
-echo '*qperf*' >> set_graph_function 2>/dev/null || true
+# 注意：不设置 set_graph_function，追踪所有函数
+# 然后用 grep 过滤查看需要的函数
+# 因为 set_graph_function 只能选择内核导出的函数，无法追踪动态库中的 ShmipcWrite 等
 
 # 可选：显示函数执行时长（默认已开启）
 echo 1 > options/funcgraph-duration 2>/dev/null || true

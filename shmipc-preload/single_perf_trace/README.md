@@ -441,15 +441,13 @@ echo 0 > tracing_on           # 先停止
 echo > trace                  # 清空旧数据
 echo function_graph > current_tracer   # 使用函数图追踪器
 
-# 可选：只追踪 shmipc/qperf 相关函数（减少数据量）
-echo '*shmipc*' > set_graph_function
-echo '*qperf*' >> set_graph_function
+# 注意：不设置 set_graph_function
+# 因为 set_graph_function 只能选择内核导出的函数（查看: cat available_filter_functions）
+# 无法追踪动态链接库中的函数（如 glibc 的 write/send，或 Go 的 ShmipcWrite）
+# 所以追踪所有函数，然后 grep 过滤
 
-# 可选：显示函数执行时长（默认已开启）
+# 显示函数执行时长
 echo 1 > options/funcgraph-duration
-
-# 可选：显示绝对时间戳
-echo 1 > options/funcgraph-abstime
 
 # 开始追踪
 echo 1 > tracing_on
@@ -459,7 +457,12 @@ LD_PRELOAD=./libshmipc.so qperf 127.0.0.1 -msg_size 524288 -t 60 tcp_bw tcp_lat
 
 # qperf 结束后，Terminal 2 查看结果
 echo 0 > tracing_on           # 停止追踪
-cat trace                     # 查看结果
+
+# 查看所有结果
+cat trace | head -100
+
+# 过滤查看需要的函数
+grep -E "Shmipc|write|send|recv|sock_send|sock_recv" trace | head -100
 ```
 
 ### 或使用简化脚本
