@@ -548,3 +548,173 @@ single_perf_trace/
 | 需要详细分析报告 | `ftrace_analyze.sh` |
 | 需要火焰图 | `run_perf_analysis.sh` |
 | 全部都要 | `run_all.sh` |
+
+---
+
+## 最简火焰图生成（perf + FlameGraph）
+
+只需要 **3 步**，就能生成完整的火焰图。
+
+### 前提条件
+
+```bash
+# 1. 检查 perf 是否安装
+perf version
+
+# 2. 检查 FlameGraph（如果没有会下载）
+ls ~/FlameGraph/stackcollapse-perf.pl 2>/dev/null || echo "需要下载 FlameGraph"
+
+# 3. 检查 root 权限
+id | grep root
+```
+
+### Step 1: 下载 FlameGraph（一次性）
+
+```bash
+cd ~
+git clone --depth 1 https://github.com/brendangregg/FlameGraph.git
+cd FlameGraph
+ls *.pl
+```
+
+### Step 2: 运行 perf record（服务端）
+
+**Terminal 1 - 启动 qperf server（后台）：**
+
+```bash
+cd /path/to/shmipc-preload
+LD_PRELOAD=./libshmipc.so qperf &
+sleep 2
+```
+
+### Step 3: 运行 perf record（30 秒）+ qperf client
+
+**Terminal 2 - 运行 perf record：**
+
+```bash
+# 创建输出目录
+mkdir -p ~/shmipc_perf
+cd ~/shmipc_perf
+
+# 运行 perf record（30 秒足够了）
+sudo perf record -F 99 -a -g -- sleep 30
+```
+
+**Terminal 3 - 运行 qperf client：**
+
+```bash
+# 在 perf record 运行期间执行
+cd /path/to/shmipc-preload
+LD_PRELOAD=./libshmipc.so qperf 127.0.0.1 -msg_size 524288 -t 120 tcp_bw tcp_lat
+```
+
+### Step 4: 生成火焰图
+
+```bash
+cd ~/shmipc_perf
+
+# 生成折叠堆栈
+~/FlameGraph/stackcollapse-perf.pl perf.data > perf.folded
+
+# 生成火焰图 SVG
+~/FlameGraph/flamegraph.pl perf.folded > shmipc_flamegraph.svg
+
+# 查看
+firefox ~/shmipc_perf/shmipc_flamegraph.svg
+```
+
+### 如果想看文本报告（不用火焰图）
+
+```bash
+cd ~/shmipc_perf
+
+# Top 函数
+sudo perf report --stdio -g none -i perf.data | head -80
+
+# 带调用关系
+sudo perf report --stdio -g caller -i perf.data | head -100
+```
+
+### 完整命令汇总（一键复制）
+
+```bash
+# ===== Step 1: 下载 FlameGraph =====
+git clone --depth 1 https://github.com/brendangregg/FlameGraph.git ~/FlameGraph
+
+# ===== Step 2: 创建输出目录 =====
+mkdir -p ~/shmipc_perf
+
+# ===== Step 3: 启动 qperf server（Terminal 1）=====
+cd /path/to/shmipc-preload
+LD_PRELOAD=./libshmipc.so qperf &
+
+# ===== Step 4: 运行 perf record（Terminal 2）=====
+cd ~/shmipc_perf
+sudo perf record -F 99 -a -g -- sleep 30
+
+# ===== Step 5: 运行 qperf client（Terminal 3）=====
+cd /path/to/shmipc-preload
+LD_PRELOAD=./libshmipc.so qperf 127.0.0.1 -msg_size 524288 -t 120 tcp_bw tcp_lat
+
+# ===== Step 6: 生成火焰图（Terminal 2 或新终端）=====
+cd ~/shmipc_perf
+~/FlameGraph/stackcollapse-perf.pl perf.data > perf.folded
+~/FlameGraph/flamegraph.pl perf.folded > shmipc_flamegraph.svg
+
+# 查看
+firefox ~/shmipc_perf/shmipc_flamegraph.svg
+```
+
+### 火焰图解读
+
+```
+火焰图阅读方法：
+
+  从下往上看 = 调用栈
+  宽度 = 该函数占用的 CPU 比例
+  颜色：
+    红色 = C/C++ 函数
+    黄色 = Go 函数
+    橙色 = 内核函数
+
+  顶层方框 = 当前正在执行的函数（热点）
+```
+
+### 预期看到的函数
+
+| 函数类型 | 示例函数 |
+|---------|---------|
+| CGO | `ShmipcWrite`, `ShmipcRead`, `ShmipcAcceptStream` |
+| Go runtime | `runtime.slicecopy`, `runtime.mallocgc` |
+| 系统调用 | `write`, `read`, `epoll_wait` |
+| 内存拷贝 | `memcpy` |
+| 网络 | `tcp_sendmsg`, `tcp_recvmsg` |
+
+### 常见问题
+
+**Q: perf: command not found**
+```bash
+sudo apt install linux-tools-common linux-tools-generic
+```
+
+**Q: Permission denied**
+```bash
+# 检查
+cat /proc/sys/kernel/perf_event_paranoid
+# 如果 > 1，设置为 1
+sudo sysctl kernel.perf_event_paranoid=1
+```
+
+**Q: FlameGraph 下载失败**
+```bash
+# 手动下载
+wget https://raw.githubusercontent.com/brendangregg/FlameGraph/master/stackcollapse-perf.pl
+wget https://raw.githubusercontent.com/brendangregg/FlameGraph/master/flamegraph.pl
+chmod +x *.pl
+```
+
+**Q: perf.data 文件很大**
+```bash
+ls -lh ~/shmipc_perf/perf.data
+# 正常，30 秒 record 可能几十 MB
+```
