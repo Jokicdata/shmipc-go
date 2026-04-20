@@ -7,9 +7,18 @@
  * 1. 支持 writev/readv 批量操作
  * 2. 减少锁竞争 (per-FD 锁)
  * 3. 优化数据路径，避免不必要的拷贝
+ * 4. 完善的回退机制：shmipc 失败时自动回退到原始 socket
+ * 5. 低开销统计日志：异步写入，不影响数据路径性能
  *
  * 使用方式：
  *   LD_PRELOAD=./libshmipc.so <your-program>
+ *
+ * 环境变量：
+ *   SHMIPC_LOG=0|1|2|3|4  日志级别 (0=静默 1=ERROR 2=WARN 3=INFO 4=DEBUG)
+ *   SHMIPC_ENABLE=0|1     是否启用 shmipc (默认 1)
+ *   SHMIPC_STATS=1        启用统计日志 (默认关闭)
+ *   SHMIPC_STATS_FILE=路径 统计日志文件 (默认 /tmp/shmipc_stats.log)
+ *   SHMIPC_STATS_INTERVAL=秒 统计日志输出间隔 (默认 10)
  */
 
 #define _GNU_SOURCE
@@ -30,6 +39,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/uio.h>
+#include <sys/time.h>
 
 /* ========== 配置常量 ========== */
 #define MAX_FDS 4096
@@ -52,6 +62,25 @@
 #define STREAM_STATE_OPEN   0
 #define STREAM_STATE_CLOSED 1
 
+/* ========== 回退原因 ========== */
+#define FALLBACK_NONE            0
+#define FALLBACK_INIT_FAILED     1
+#define FALLBACK_NOT_LOCAL       2
+#define FALLBACK_SESSION_FAILED  3
+#define FALLBACK_STREAM_FAILED   4
+#define FALLBACK_WRITE_FAILED    5
+#define FALLBACK_READ_FAILED     6
+
+static const char *fallback_reasons[] = {
+    "none",
+    "init_failed",
+    "not_local_addr",
+    "session_create_failed",
+    "stream_open_failed",
+    "write_failed",
+    "read_failed"
+};
+
 /* ========== 外部 Go 函数声明 ========== */
 extern int ShmipcInit(void);
 extern void ShmipcCleanup(void);
@@ -72,6 +101,12 @@ extern int ShmipcGetStats(void *stats);
 static int g_log_level = LOG_ERROR;
 static int g_initialized = 0;
 static int g_shmipc_enabled = 1;
+static int g_stats_enabled = 0;
+static int g_stats_interval = 10;
+static char g_stats_file[512] = "/tmp/shmipc_stats.log";
+static int g_stats_fd = -1;
+static pthread_t g_stats_thread = 0;
+static volatile int g_stats_running = 0;
 
 /* ========== 原始函数指针 ========== */
 static int (*real_socket)(int, int, int);
@@ -107,6 +142,7 @@ typedef struct {
     int is_listening;
     int is_server;
     int stream_id;
+    int fallback_reason;
     char path[MAX_PATH];
     pthread_mutex_t lock;
 } fd_info_t;
@@ -120,12 +156,22 @@ static struct {
     uint64_t total_connections;
     uint64_t shmipc_connections;
     uint64_t socket_connections;
+    uint64_t fallback_connections;
     uint64_t total_bytes_sent;
     uint64_t total_bytes_recv;
     uint64_t shmipc_bytes_sent;
     uint64_t shmipc_bytes_recv;
+    uint64_t socket_bytes_sent;
+    uint64_t socket_bytes_recv;
     uint64_t vectored_write_count;
     uint64_t vectored_read_count;
+    uint64_t shmipc_write_calls;
+    uint64_t shmipc_read_calls;
+    uint64_t socket_write_calls;
+    uint64_t socket_read_calls;
+    uint64_t shmipc_write_errors;
+    uint64_t shmipc_read_errors;
+    uint64_t fallback_reason_counts[7];
 } g_stats;
 
 /* ========== 日志函数 ========== */
@@ -140,6 +186,178 @@ static void log_msg(int level, const char *fmt, ...) {
     vfprintf(stderr, fmt, args);
     fprintf(stderr, "\n");
     va_end(args);
+}
+
+/* ========== 获取时间戳字符串（用于统计日志）========== */
+static void get_timestamp(char *buf, size_t len) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    struct tm tm_val;
+    localtime_r(&tv.tv_sec, &tm_val);
+    snprintf(buf, len, "%04d-%02d-%02d %02d:%02d:%02d.%03ld",
+             tm_val.tm_year + 1900, tm_val.tm_mon + 1, tm_val.tm_mday,
+             tm_val.tm_hour, tm_val.tm_min, tm_val.tm_sec,
+             tv.tv_usec / 1000);
+}
+
+/* ========== 统计日志写入（低开销：只写文件，不格式化到 stderr）========== */
+static void stats_log(const char *msg) {
+    if (g_stats_fd < 0) return;
+    int len = strlen(msg);
+    write(g_stats_fd, msg, len);
+}
+
+/* ========== 统计线程（定期输出统计信息到文件）========== */
+static void *stats_thread_func(void *arg) {
+    (void)arg;
+    char buf[2048];
+    char ts[64];
+
+    while (g_stats_running) {
+        sleep(g_stats_interval);
+
+        get_timestamp(ts, sizeof(ts));
+
+        int n = snprintf(buf, sizeof(buf),
+            "[%s] STATS\n"
+            "  connections: total=%lu shmipc=%lu socket=%lu fallback=%lu\n"
+            "  shmipc_traffic: sent=%lu bytes (%lu calls) recv=%lu bytes (%lu calls)\n"
+            "  socket_traffic: sent=%lu bytes (%lu calls) recv=%lu bytes (%lu calls)\n"
+            "  errors: write_errors=%lu read_errors=%lu\n"
+            "  fallback_reasons: init=%lu not_local=%lu session=%lu stream=%lu write=%lu read=%lu\n"
+            "  vectored: writes=%lu reads=%lu\n"
+            "  shmipc_ratio: sent=%.1f%% recv=%.1f%%\n",
+            ts,
+            (unsigned long)g_stats.total_connections,
+            (unsigned long)g_stats.shmipc_connections,
+            (unsigned long)g_stats.socket_connections,
+            (unsigned long)g_stats.fallback_connections,
+            (unsigned long)g_stats.shmipc_bytes_sent,
+            (unsigned long)g_stats.shmipc_write_calls,
+            (unsigned long)g_stats.shmipc_bytes_recv,
+            (unsigned long)g_stats.shmipc_read_calls,
+            (unsigned long)g_stats.socket_bytes_sent,
+            (unsigned long)g_stats.socket_write_calls,
+            (unsigned long)g_stats.socket_bytes_recv,
+            (unsigned long)g_stats.socket_read_calls,
+            (unsigned long)g_stats.shmipc_write_errors,
+            (unsigned long)g_stats.shmipc_read_errors,
+            (unsigned long)g_stats.fallback_reason_counts[FALLBACK_INIT_FAILED],
+            (unsigned long)g_stats.fallback_reason_counts[FALLBACK_NOT_LOCAL],
+            (unsigned long)g_stats.fallback_reason_counts[FALLBACK_SESSION_FAILED],
+            (unsigned long)g_stats.fallback_reason_counts[FALLBACK_STREAM_FAILED],
+            (unsigned long)g_stats.fallback_reason_counts[FALLBACK_WRITE_FAILED],
+            (unsigned long)g_stats.fallback_reason_counts[FALLBACK_READ_FAILED],
+            (unsigned long)g_stats.vectored_write_count,
+            (unsigned long)g_stats.vectored_read_count,
+            g_stats.total_bytes_sent > 0 ?
+                100.0 * g_stats.shmipc_bytes_sent / g_stats.total_bytes_sent : 0.0,
+            g_stats.total_bytes_recv > 0 ?
+                100.0 * g_stats.shmipc_bytes_recv / g_stats.total_bytes_recv : 0.0
+        );
+
+        if (n > 0 && n < (int)sizeof(buf)) {
+            stats_log(buf);
+        }
+    }
+
+    return NULL;
+}
+
+/* ========== 启动统计线程 ========== */
+static void start_stats_thread(void) {
+    if (!g_stats_enabled) return;
+
+    g_stats_fd = open(g_stats_file, O_WRONLY | O_CREAT | O_APPEND | O_NONBLOCK, 0644);
+    if (g_stats_fd < 0) {
+        log_msg(LOG_WARN, "Failed to open stats file: %s", g_stats_file);
+        return;
+    }
+
+    g_stats_running = 1;
+    if (pthread_create(&g_stats_thread, NULL, stats_thread_func, NULL) != 0) {
+        log_msg(LOG_WARN, "Failed to create stats thread");
+        close(g_stats_fd);
+        g_stats_fd = -1;
+        g_stats_running = 0;
+        return;
+    }
+
+    char ts[64];
+    get_timestamp(ts, sizeof(ts));
+    char msg[256];
+    snprintf(msg, sizeof(msg), "[%s] shmipc stats logging started (interval=%ds, pid=%d)\n",
+             ts, g_stats_interval, getpid());
+    stats_log(msg);
+}
+
+/* ========== 停止统计线程 ========== */
+static void stop_stats_thread(void) {
+    if (!g_stats_running) return;
+
+    g_stats_running = 0;
+    if (g_stats_thread) {
+        pthread_join(g_stats_thread, NULL);
+        g_stats_thread = 0;
+    }
+
+    if (g_stats_fd >= 0) {
+        char ts[64];
+        get_timestamp(ts, sizeof(ts));
+
+        char buf[2048];
+        int n = snprintf(buf, sizeof(buf),
+            "[%s] shmipc stats final report\n"
+            "  connections: total=%lu shmipc=%lu socket=%lu fallback=%lu\n"
+            "  shmipc_traffic: sent=%lu bytes (%lu calls) recv=%lu bytes (%lu calls)\n"
+            "  socket_traffic: sent=%lu bytes (%lu calls) recv=%lu bytes (%lu calls)\n"
+            "  errors: write_errors=%lu read_errors=%lu\n"
+            "  shmipc_ratio: sent=%.1f%% recv=%.1f%%\n"
+            "  shmipc stats logging stopped\n",
+            ts,
+            (unsigned long)g_stats.total_connections,
+            (unsigned long)g_stats.shmipc_connections,
+            (unsigned long)g_stats.socket_connections,
+            (unsigned long)g_stats.fallback_connections,
+            (unsigned long)g_stats.shmipc_bytes_sent,
+            (unsigned long)g_stats.shmipc_write_calls,
+            (unsigned long)g_stats.shmipc_bytes_recv,
+            (unsigned long)g_stats.shmipc_read_calls,
+            (unsigned long)g_stats.socket_bytes_sent,
+            (unsigned long)g_stats.socket_write_calls,
+            (unsigned long)g_stats.socket_bytes_recv,
+            (unsigned long)g_stats.socket_read_calls,
+            (unsigned long)g_stats.shmipc_write_errors,
+            (unsigned long)g_stats.shmipc_read_errors,
+            g_stats.total_bytes_sent > 0 ?
+                100.0 * g_stats.shmipc_bytes_sent / g_stats.total_bytes_sent : 0.0,
+            g_stats.total_bytes_recv > 0 ?
+                100.0 * g_stats.shmipc_bytes_recv / g_stats.total_bytes_recv : 0.0
+        );
+        if (n > 0) write(g_stats_fd, buf, n);
+
+        close(g_stats_fd);
+        g_stats_fd = -1;
+    }
+}
+
+/* ========== 回退到 socket（标记 fd 并记录原因）========== */
+static void fallback_to_socket(fd_info_t *info, int reason) {
+    if (info == NULL) return;
+
+    int was_shmipc = (info->conn_type == CONN_TYPE_SHMIPC);
+    info->conn_type = CONN_TYPE_SOCKET;
+    info->stream_id = -1;
+    info->fallback_reason = reason;
+
+    if (was_shmipc) {
+        __sync_fetch_and_add(&g_stats.fallback_connections, 1);
+        __sync_fetch_and_add(&g_stats.fallback_reason_counts[reason], 1);
+        __sync_fetch_and_sub(&g_stats.shmipc_connections, 1);
+        __sync_fetch_and_add(&g_stats.socket_connections, 1);
+        log_msg(LOG_INFO, "fd=%d fallback to socket: %s",
+                info->fd, fallback_reasons[reason]);
+    }
 }
 
 /* ========== 初始化原始函数指针 ========== */
@@ -187,6 +405,7 @@ static void init_fd_info(int fd, int domain, int type, int protocol) {
     info->protocol = protocol;
     info->conn_type = CONN_TYPE_SOCKET;
     info->stream_id = -1;
+    info->fallback_reason = FALLBACK_NONE;
     pthread_mutex_init(&info->lock, NULL);
 }
 
@@ -260,23 +479,44 @@ static void lib_init(void) {
         g_shmipc_enabled = 0;
     }
 
+    char *stats_env = getenv("SHMIPC_STATS");
+    if (stats_env && strcmp(stats_env, "1") == 0) {
+        g_stats_enabled = 1;
+    }
+
+    char *stats_file_env = getenv("SHMIPC_STATS_FILE");
+    if (stats_file_env) {
+        strncpy(g_stats_file, stats_file_env, sizeof(g_stats_file) - 1);
+    }
+
+    char *stats_interval_env = getenv("SHMIPC_STATS_INTERVAL");
+    if (stats_interval_env) {
+        g_stats_interval = atoi(stats_interval_env);
+        if (g_stats_interval < 1) g_stats_interval = 10;
+    }
+
     memset(g_fds, 0, sizeof(g_fds));
     memset(&g_stats, 0, sizeof(g_stats));
 
     int ret = ShmipcInit();
     if (ret != 0) {
-        log_msg(LOG_WARN, "ShmipcInit failed: %d, fallback to socket", ret);
+        log_msg(LOG_WARN, "ShmipcInit failed: %d, fallback to socket for all connections", ret);
         g_shmipc_enabled = 0;
+        __sync_fetch_and_add(&g_stats.fallback_reason_counts[FALLBACK_INIT_FAILED], 1);
     }
 
+    start_stats_thread();
+
     g_initialized = 1;
-    log_msg(LOG_INFO, "shmipc-preload loaded (enabled: %d, log: %d)",
-            g_shmipc_enabled, g_log_level);
+    log_msg(LOG_INFO, "shmipc-preload loaded (enabled: %d, log: %d, stats: %d, pid: %d)",
+            g_shmipc_enabled, g_log_level, g_stats_enabled, getpid());
 }
 
 /* ========== 库清理 ========== */
 __attribute__((destructor))
 static void lib_fini(void) {
+    stop_stats_thread();
+
     for (int i = 0; i < MAX_FDS; i++) {
         if (g_fds[i].fd > 0) {
             cleanup_fd_info(i);
@@ -299,7 +539,7 @@ int socket(int domain, int type, int protocol) {
     fd_info_t *info = get_fd_info(fd);
     if (info && should_use_shmipc(domain, type)) {
         info->conn_type = CONN_TYPE_SHMIPC;
-        log_msg(LOG_DEBUG, "socket(%d, %d, %d) = %d [shmipc]",
+        log_msg(LOG_DEBUG, "socket(%d, %d, %d) = %d [shmipc candidate]",
                domain, type, protocol, fd);
     } else {
         log_msg(LOG_DEBUG, "socket(%d, %d, %d) = %d [socket]",
@@ -339,9 +579,11 @@ int listen(int sockfd, int backlog) {
         if (info->conn_type == CONN_TYPE_SHMIPC && info->is_server) {
             int ret = ShmipcCreateServerSession(sockfd, info->path);
             if (ret != 0) {
-                log_msg(LOG_WARN, "ShmipcCreateServerSession failed: %d", ret);
+                log_msg(LOG_WARN, "ShmipcCreateServerSession(fd=%d) failed: %d, fallback to socket", sockfd, ret);
+                fallback_to_socket(info, FALLBACK_SESSION_FAILED);
+            } else {
+                log_msg(LOG_INFO, "ShmipcCreateServerSession(fd=%d) OK [shmipc]", sockfd);
             }
-            log_msg(LOG_DEBUG, "listen(%d, %d) [shmipc]", sockfd, backlog);
         }
     }
 
@@ -370,11 +612,13 @@ int accept(int sockfd, struct sockaddr *addr, socklen_t *addrlen) {
             int stream_id = ShmipcAcceptStream(sockfd);
             if (stream_id >= 0) {
                 client_info->stream_id = stream_id;
-                log_msg(LOG_DEBUG, "accept(%d) = %d, stream=%d [shmipc]",
+                __sync_fetch_and_add(&g_stats.shmipc_connections, 1);
+                log_msg(LOG_INFO, "accept(%d) = %d, stream=%d [shmipc]",
                        sockfd, client_fd, stream_id);
+            } else {
+                log_msg(LOG_WARN, "ShmipcAcceptStream(fd=%d) failed: %d, fallback to socket", sockfd, stream_id);
+                fallback_to_socket(client_info, FALLBACK_STREAM_FAILED);
             }
-
-            __sync_fetch_and_add(&g_stats.shmipc_connections, 1);
         }
     } else {
         __sync_fetch_and_add(&g_stats.socket_connections, 1);
@@ -405,11 +649,13 @@ int accept4(int sockfd, struct sockaddr *addr, socklen_t *addrlen, int flags) {
             int stream_id = ShmipcAcceptStream(sockfd);
             if (stream_id >= 0) {
                 client_info->stream_id = stream_id;
-                log_msg(LOG_DEBUG, "accept4(%d) = %d, stream=%d [shmipc]",
+                __sync_fetch_and_add(&g_stats.shmipc_connections, 1);
+                log_msg(LOG_INFO, "accept4(%d) = %d, stream=%d [shmipc]",
                        sockfd, client_fd, stream_id);
+            } else {
+                log_msg(LOG_WARN, "ShmipcAcceptStream(fd=%d) failed: %d, fallback to socket", sockfd, stream_id);
+                fallback_to_socket(client_info, FALLBACK_STREAM_FAILED);
             }
-
-            __sync_fetch_and_add(&g_stats.shmipc_connections, 1);
         }
     } else {
         __sync_fetch_and_add(&g_stats.socket_connections, 1);
@@ -432,6 +678,9 @@ int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
             use_shmipc = 1;
         } else if (addr && is_loopback_addr(addr, addrlen)) {
             use_shmipc = 1;
+        } else {
+            log_msg(LOG_INFO, "connect(%d) non-local address, fallback to socket", sockfd);
+            fallback_to_socket(info, FALLBACK_NOT_LOCAL);
         }
     }
 
@@ -440,20 +689,23 @@ int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
     if (ret == 0 && info) {
         info->is_connected = 1;
 
-        if (use_shmipc) {
+        if (use_shmipc && info->conn_type == CONN_TYPE_SHMIPC) {
             int shmipc_ret = ShmipcCreateClientSession(sockfd, info->path);
             if (shmipc_ret == 0) {
                 int stream_id = ShmipcOpenStream(sockfd);
                 if (stream_id >= 0) {
                     info->stream_id = stream_id;
-                    log_msg(LOG_DEBUG, "connect(%d, \"%s\") stream=%d [shmipc]",
-                           sockfd, info->path, stream_id);
+                    __sync_fetch_and_add(&g_stats.shmipc_connections, 1);
+                    log_msg(LOG_INFO, "connect(%d) stream=%d [shmipc]",
+                           sockfd, stream_id);
+                } else {
+                    log_msg(LOG_WARN, "ShmipcOpenStream(fd=%d) failed: %d, fallback to socket", sockfd, stream_id);
+                    fallback_to_socket(info, FALLBACK_STREAM_FAILED);
                 }
             } else {
-                log_msg(LOG_WARN, "ShmipcCreateClientSession failed: %d", shmipc_ret);
+                log_msg(LOG_WARN, "ShmipcCreateClientSession(fd=%d) failed: %d, fallback to socket", sockfd, shmipc_ret);
+                fallback_to_socket(info, FALLBACK_SESSION_FAILED);
             }
-
-            __sync_fetch_and_add(&g_stats.shmipc_connections, 1);
         } else {
             __sync_fetch_and_add(&g_stats.socket_connections, 1);
         }
@@ -473,13 +725,19 @@ ssize_t send(int sockfd, const void *buf, size_t len, int flags) {
         if (ret > 0) {
             __sync_fetch_and_add(&g_stats.shmipc_bytes_sent, ret);
             __sync_fetch_and_add(&g_stats.total_bytes_sent, ret);
+            __sync_fetch_and_add(&g_stats.shmipc_write_calls, 1);
             return (ssize_t)ret;
         }
+        __sync_fetch_and_add(&g_stats.shmipc_write_errors, 1);
+        log_msg(LOG_WARN, "ShmipcWrite(stream=%d) failed: %ld, fallback to socket", info->stream_id, ret);
+        fallback_to_socket(info, FALLBACK_WRITE_FAILED);
     }
 
     ssize_t ret = real_send(sockfd, buf, len, flags);
     if (ret > 0) {
+        __sync_fetch_and_add(&g_stats.socket_bytes_sent, ret);
         __sync_fetch_and_add(&g_stats.total_bytes_sent, ret);
+        __sync_fetch_and_add(&g_stats.socket_write_calls, 1);
     }
     return ret;
 }
@@ -495,13 +753,19 @@ ssize_t recv(int sockfd, void *buf, size_t len, int flags) {
         if (ret > 0) {
             __sync_fetch_and_add(&g_stats.shmipc_bytes_recv, ret);
             __sync_fetch_and_add(&g_stats.total_bytes_recv, ret);
+            __sync_fetch_and_add(&g_stats.shmipc_read_calls, 1);
             return (ssize_t)ret;
         }
+        __sync_fetch_and_add(&g_stats.shmipc_read_errors, 1);
+        log_msg(LOG_WARN, "ShmipcRead(stream=%d) failed: %ld, fallback to socket", info->stream_id, ret);
+        fallback_to_socket(info, FALLBACK_READ_FAILED);
     }
 
     ssize_t ret = real_recv(sockfd, buf, len, flags);
     if (ret > 0) {
+        __sync_fetch_and_add(&g_stats.socket_bytes_recv, ret);
         __sync_fetch_and_add(&g_stats.total_bytes_recv, ret);
+        __sync_fetch_and_add(&g_stats.socket_read_calls, 1);
     }
     return ret;
 }
@@ -517,13 +781,19 @@ ssize_t write(int fd, const void *buf, size_t count) {
         if (ret > 0) {
             __sync_fetch_and_add(&g_stats.shmipc_bytes_sent, ret);
             __sync_fetch_and_add(&g_stats.total_bytes_sent, ret);
+            __sync_fetch_and_add(&g_stats.shmipc_write_calls, 1);
             return (ssize_t)ret;
         }
+        __sync_fetch_and_add(&g_stats.shmipc_write_errors, 1);
+        log_msg(LOG_WARN, "ShmipcWrite(stream=%d) failed: %ld, fallback to socket", info->stream_id, ret);
+        fallback_to_socket(info, FALLBACK_WRITE_FAILED);
     }
 
     ssize_t ret = real_write(fd, buf, count);
     if (ret > 0) {
+        __sync_fetch_and_add(&g_stats.socket_bytes_sent, ret);
         __sync_fetch_and_add(&g_stats.total_bytes_sent, ret);
+        __sync_fetch_and_add(&g_stats.socket_write_calls, 1);
     }
     return ret;
 }
@@ -539,13 +809,19 @@ ssize_t read(int fd, void *buf, size_t count) {
         if (ret > 0) {
             __sync_fetch_and_add(&g_stats.shmipc_bytes_recv, ret);
             __sync_fetch_and_add(&g_stats.total_bytes_recv, ret);
+            __sync_fetch_and_add(&g_stats.shmipc_read_calls, 1);
             return (ssize_t)ret;
         }
+        __sync_fetch_and_add(&g_stats.shmipc_read_errors, 1);
+        log_msg(LOG_WARN, "ShmipcRead(stream=%d) failed: %ld, fallback to socket", info->stream_id, ret);
+        fallback_to_socket(info, FALLBACK_READ_FAILED);
     }
 
     ssize_t ret = real_read(fd, buf, count);
     if (ret > 0) {
+        __sync_fetch_and_add(&g_stats.socket_bytes_recv, ret);
         __sync_fetch_and_add(&g_stats.total_bytes_recv, ret);
+        __sync_fetch_and_add(&g_stats.socket_read_calls, 1);
     }
     return ret;
 }
@@ -562,13 +838,19 @@ ssize_t writev(int fd, const struct iovec *iov, int iovcnt) {
             __sync_fetch_and_add(&g_stats.shmipc_bytes_sent, ret);
             __sync_fetch_and_add(&g_stats.total_bytes_sent, ret);
             __sync_fetch_and_add(&g_stats.vectored_write_count, 1);
+            __sync_fetch_and_add(&g_stats.shmipc_write_calls, 1);
             return (ssize_t)ret;
         }
+        __sync_fetch_and_add(&g_stats.shmipc_write_errors, 1);
+        log_msg(LOG_WARN, "ShmipcWriteVectored(stream=%d) failed: %ld, fallback to socket", info->stream_id, ret);
+        fallback_to_socket(info, FALLBACK_WRITE_FAILED);
     }
 
     ssize_t ret = real_writev(fd, iov, iovcnt);
     if (ret > 0) {
+        __sync_fetch_and_add(&g_stats.socket_bytes_sent, ret);
         __sync_fetch_and_add(&g_stats.total_bytes_sent, ret);
+        __sync_fetch_and_add(&g_stats.socket_write_calls, 1);
     }
     return ret;
 }
@@ -585,13 +867,19 @@ ssize_t readv(int fd, const struct iovec *iov, int iovcnt) {
             __sync_fetch_and_add(&g_stats.shmipc_bytes_recv, ret);
             __sync_fetch_and_add(&g_stats.total_bytes_recv, ret);
             __sync_fetch_and_add(&g_stats.vectored_read_count, 1);
+            __sync_fetch_and_add(&g_stats.shmipc_read_calls, 1);
             return (ssize_t)ret;
         }
+        __sync_fetch_and_add(&g_stats.shmipc_read_errors, 1);
+        log_msg(LOG_WARN, "ShmipcReadVectored(stream=%d) failed: %ld, fallback to socket", info->stream_id, ret);
+        fallback_to_socket(info, FALLBACK_READ_FAILED);
     }
 
     ssize_t ret = real_readv(fd, iov, iovcnt);
     if (ret > 0) {
+        __sync_fetch_and_add(&g_stats.socket_bytes_recv, ret);
         __sync_fetch_and_add(&g_stats.total_bytes_recv, ret);
+        __sync_fetch_and_add(&g_stats.socket_read_calls, 1);
     }
     return ret;
 }
